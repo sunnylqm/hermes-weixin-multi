@@ -333,3 +333,28 @@ def register(ctx):
         handler=_handle_wechat_list_cmd,
         description="查看所有微信账号状态",
     )
+
+    # ── Register as agent tools (works in WebUI/Desktop where commands bypass gateway) ──
+    ctx.register_tool(
+        name="wechat_login",
+        toolset="hermes-cli",
+        schema={
+            "description": "添加新的微信账号到 Hermes（扫码登录）。"
+                           "生成二维码让用户用微信扫描并确认，扫码后自动完成添加。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=_handle_wechat_login_cmd,
+        is_async=True,
+        description="添加新微信账号（扫码登录）",
+    )
+    ctx.register_tool(
+        name="wechat_list",
+        toolset="hermes-cli",
+        schema={
+            "description": "查看所有已连接的微信账号及其状态。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=_handle_wechat_list_cmd,
+        is_async=False,
+        description="查看微信账号列表",
+    )
