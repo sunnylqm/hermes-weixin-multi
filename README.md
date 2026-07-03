@@ -36,8 +36,9 @@
 - Python 依赖：`aiohttp`、`cryptography`、`qrcode[pil]`
 
 ```bash
-pip install aiohttp cryptography qrcode[pil]
+pip install aiohttp cryptography 'qrcode[pil]'
 ```
+> ⚠️ Linux/macOS 必须加引号 `'qrcode[pil]'`，Windows 不需要。
 
 ### 1. 克隆插件 / Clone Plugin
 
