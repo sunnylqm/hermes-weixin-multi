@@ -30,10 +30,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 # Resolve the multi-weixin source directory
-_MULTI_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "..", "..", "..", "opt", "hermes-weixin-multi"
-)
+# 1. Try local directory first (fresh install, weixin.py is alongside adapter.py)
+_plugin_dir = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(_plugin_dir, "weixin.py")):
+    _MULTI_DIR = _plugin_dir
+else:
+    # 2. Fallback to development path (hyonex local setup)
+    _MULTI_DIR = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "..", "opt", "hermes-weixin-multi"
+    )
 _MULTI_DIR = os.path.realpath(_MULTI_DIR)
 
 if _MULTI_DIR not in sys.path:
