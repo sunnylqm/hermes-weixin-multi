@@ -76,19 +76,36 @@ hermes gateway restart
 
 ### 添加微信账号 / Add WeChat Account
 
-在任何已绑定的渠道发送 / Send from any connected channel:
+根据你使用的界面不同，操作方式也不同：
 
+**方式一：在微信/Telegram 聊天中（推荐）**
+发送斜杠命令即可：
 ```
 /wechat-login
 ```
-
 插件会生成二维码，用微信扫码并确认即可自动添加。
-*The plugin generates a QR code — scan with WeChat and confirm to auto-add.*
+*Send `/wechat-login` in any connected WeChat or Telegram chat.*
+
+**方式二：在 Hermes WebUI 或 Desktop 中**
+直接输入文字告诉 AI 你要添加微信账号，例如：
+```
+帮我添加一个微信账号
+```
+或者：
+```
+运行微信登录
+```
+AI 会自动调用 `wechat_login` 工具生成二维码。
 
 ### 查看账号列表 / List Accounts
 
+**在微信/Telegram 中：**
 ```
 /wechat-list
+```
+**在 WebUI/Desktop 中：**
+```
+查看微信账号列表
 ```
 
 示例输出 / Example output:
