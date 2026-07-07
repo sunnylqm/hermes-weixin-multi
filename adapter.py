@@ -30,17 +30,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 # Resolve the multi-weixin source directory
-# 1. Try local directory first (fresh install, weixin.py is alongside adapter.py)
+# weixin.py MUST be alongside adapter.py (hermes plugins install does this)
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
-if os.path.exists(os.path.join(_plugin_dir, "weixin.py")):
+_weixin_path = os.path.join(_plugin_dir, "weixin.py")
+if os.path.exists(_weixin_path):
     _MULTI_DIR = _plugin_dir
 else:
-    # 2. Fallback to development path (hyonex local setup)
-    _MULTI_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "..", "..", "opt", "hermes-weixin-multi"
-    )
-_MULTI_DIR = os.path.realpath(_MULTI_DIR)
+    _MULTI_DIR = _plugin_dir
+    _weixin_path = None  # will be checked again in register()
 
 if _MULTI_DIR not in sys.path:
     sys.path.insert(0, _MULTI_DIR)
@@ -220,8 +217,8 @@ def register(ctx):
     weixin_path = os.path.join(_MULTI_DIR, "weixin.py")
     if not os.path.exists(weixin_path):
         raise FileNotFoundError(
-            f"weixin_multi adapter not found at {weixin_path}. "
-            f"Install: cp weixin.py to {_MULTI_DIR}/weixin.py"
+            f"weixin_multi: weixin.py not found at {weixin_path}. "
+            f"Plugin installation incomplete. Re-run: hermes plugins install"
         )
 
     # Dynamic import of the weixin module
@@ -262,8 +259,9 @@ def register(ctx):
 
     async def _handle_wechat_login_cmd(raw_args: str) -> str:
         """Global /wechat-login: generate QR and wait for scan.
-        
-        Runs in whatever process calls it (gateway or WebUI).
+
+        Works in WebUI, Telegram, CLI — anywhere Hermes runs.
+        Can also be invoked by AI agent via wechat_login tool.
         Saves token to ~/.hermes/weixin/accounts/<id>.json on success.
         """
         try:
@@ -296,12 +294,13 @@ def register(ctx):
                 _save_pending_qr(qrcode_value, qr_link)
 
                 return (
-                    f"📱 请用微信扫描以下链接登录：\n\n"
+                    f"📱 微信扫码登录\n\n"
+                    f"请用微信扫描：\n"
                     f"{qr_link}\n\n"
-                    f"⏳ 二维码5分钟内有效，请尽快扫描。\n\n"
-                    f"扫码后手机上点「确认」，Gateway 会自动完成登录。\n"
-                    f"登录成功后直接在微信发消息测试即可。\n"
-                    f"用 /wechat-list 查看账号状态。"
+                    f"⏳ 二维码5分钟内有效\n\n"
+                    f"扫码后手机上点「确认」即可完成登录。\n"
+                    f"用 /wechat-list 查看账号状态。\n\n"
+                    f"💡 提示：如果输入 /wechat-login 后无反应，请刷新 WebUI 页面重试。"
                 )
         except Exception as e:
             return f"❌ 获取二维码失败: {e}"
