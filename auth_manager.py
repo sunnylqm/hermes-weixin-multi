@@ -306,11 +306,20 @@ def _load_profile_map() -> dict:
 def profile_name_for(user_id: str) -> str:
     """Stable, collision-free profile name for *user_id*.
 
-    On first sight of a user, an existing legacy-named profile directory is
-    renamed to the new name so nobody loses their memories. A legacy directory
-    is adopted at most once: if a second user hashes onto the same legacy name
-    (i.e. they were already sharing one profile), the later user starts from a
-    clean profile instead of inheriting someone else's data.
+    A user who already has a legacy-named profile directory keeps that name.
+    Renaming the directory is deliberately avoided: the profile name is also
+    embedded in gateway session keys
+    (``agent:<profile>:weixin_multi:dm:<user>``) and in persisted gateway
+    state, so a rename leaves those pointing at a name that no longer exists —
+    splitting the user's session records and making the host re-materialize an
+    empty directory under the old name.
+
+    A legacy name is claimed by at most one user, recorded in the map. If a
+    second user hashes onto the same legacy name (i.e. they were already
+    sharing a profile under the old lossy scheme) the later user gets a clean
+    hashed profile rather than inheriting the first user's data — which is the
+    collision this scheme exists to prevent. Every new user gets a hashed name
+    from the start.
     """
     data = _load_profile_map()
     existing = data["users"].get(user_id)
@@ -319,26 +328,19 @@ def profile_name_for(user_id: str) -> str:
 
     name = _hashed_profile_name(user_id)
     legacy = _legacy_profile_name(user_id)
-    profiles_dir = os.path.join(HERMES_HOME, "profiles")
-    legacy_dir = os.path.join(profiles_dir, legacy)
-    new_dir = os.path.join(profiles_dir, name)
+    legacy_dir = os.path.join(HERMES_HOME, "profiles", legacy)
 
-    if os.path.isdir(legacy_dir) and not os.path.exists(new_dir):
+    if legacy != name and os.path.isdir(legacy_dir):
         if legacy in data["adopted_legacy"]:
             logger.warning(
-                "[Weixin Auth] Legacy profile %s was already adopted by another user; "
-                "starting %s with a clean profile to avoid inheriting their data.",
-                legacy, user_id,
+                "[Weixin Auth] Legacy profile %s is already claimed by another user; "
+                "giving a clean profile instead so it cannot inherit their data.",
+                legacy,
             )
         else:
-            try:
-                os.rename(legacy_dir, new_dir)
-                data["adopted_legacy"].append(legacy)
-                logger.info(
-                    "[Weixin Auth] Migrated profile %s -> %s for user %s", legacy, name, user_id
-                )
-            except OSError as e:
-                logger.error("[Weixin Auth] Failed to migrate profile %s -> %s: %s", legacy, name, e)
+            name = legacy
+            data["adopted_legacy"].append(legacy)
+            logger.info("[Weixin Auth] Claiming existing profile %s for its owner", legacy)
 
     data["users"][user_id] = name
     _save_json(PROFILE_MAP_FILE, data)
