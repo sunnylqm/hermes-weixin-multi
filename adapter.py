@@ -538,16 +538,23 @@ def register(ctx):
 
         arg = (raw_args or "").strip()
         if not arg:
-            lines = [f"🧠 当前模型：{am.current_model() or '(未配置)'}\n"]
-            for name, path in am.wx_profile_configs():
+            current = am.current_model()
+            lines = [f"🧠 主模型：{current or '(未配置)'}"]
+            lines.append(f"🔁 备用模型：{am.current_fallback_model() or '(未配置)'}\n")
+            for name, path in am.all_profile_configs():
                 try:
                     cfg = am._load_yaml(path)
                     m = (cfg.get("model") or {}).get("default")
                 except Exception:
                     m = "(读取失败)"
-                flag = "✅" if m == am.current_model() else "⚠️"
+                flag = "✅" if m == current else "⚠️"
                 lines.append(f"  {flag} {name} — {m}")
-            lines.append("\n用 /wechat-model <模型ID> 为所有微信用户统一切换。")
+            lines.append(
+                "\n用法：\n"
+                "  /wechat-model <主模型ID>\n"
+                "  /wechat-model <主模型ID> <备用模型ID>\n"
+                "改动对所有 profile 生效。"
+            )
             body = "\n".join(lines)
             if verdict == am.ADMIN_OK:
                 return body
@@ -555,11 +562,16 @@ def register(ctx):
                 am.send_telegram_notification(f"<pre>{html.escape(body)}</pre>")
             return "✅ 模型状态已发送至 Telegram 管理员会话。"
 
-        result = am.set_model_everywhere(arg)
+        parts = arg.split()
+        primary = parts[0]
+        fallback = parts[1] if len(parts) > 1 else None
+        result = am.set_model_everywhere(primary, fallback_model=fallback)
         if result["errors"] and not result["updated"]:
             return "❌ 切换失败：\n" + "\n".join(result["errors"][:5])
 
-        lines = [f"🧠 已将所有微信用户切换到：{result['model']}"]
+        lines = [f"🧠 主模型 → {result['model']}"]
+        if fallback:
+            lines.append(f"🔁 备用模型 → {result['fallback']}")
         if result["updated"]:
             lines.append(f"\n已更新 {len(result['updated'])} 个 profile：")
             for name, changed in result["updated"]:

@@ -939,6 +939,21 @@ def wx_profile_configs() -> List[Tuple[str, str]]:
     return out
 
 
+def all_profile_configs() -> List[Tuple[str, str]]:
+    """(profile_name, config_path) for every profile, default profile excluded.
+
+    Model choice is instance-wide, not WeChat-specific: a per-channel profile
+    (telegram, discord, ...) carries its own standalone copy for the same
+    reason a wx_* profile does, so "apply everywhere" has to include them.
+    """
+    out = []
+    for d in sorted(glob.glob(os.path.join(_profiles_dir(), "*"))):
+        cfg = os.path.join(d, "config.yaml")
+        if os.path.isdir(d) and os.path.isfile(cfg):
+            out.append((os.path.basename(d), cfg))
+    return out
+
+
 def _load_yaml(path: str) -> dict:
     import yaml
     with open(path, encoding="utf-8") as f:
@@ -1024,17 +1039,39 @@ def current_model() -> Optional[str]:
     return model.get("default") if isinstance(model, dict) else None
 
 
-def set_model_everywhere(model_id: Optional[str] = None) -> Dict[str, Any]:
-    """Point every WeChat user at the same model.
+def current_fallback_model() -> Optional[str]:
+    """The model of the first entry in the default profile's fallback chain."""
+    try:
+        cfg = _load_yaml(os.path.join(HERMES_HOME, "config.yaml"))
+    except Exception:
+        return None
+    chain = cfg.get("fallback_providers")
+    if isinstance(chain, list) and chain and isinstance(chain[0], dict):
+        return chain[0].get("model")
+    return None
 
-    With *model_id*, sets ``model.default`` on the default profile first;
-    either way the default profile's model config is then propagated to every
-    wx_* profile so a change lands for all users at once. Only model-related
-    keys are touched — notably not gateway.platforms or credentials, which a
-    per-user profile must not inherit.
+
+def set_model_everywhere(
+    model_id: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    wx_only: bool = False,
+) -> Dict[str, Any]:
+    """Point every profile at the same model.
+
+    *model_id* sets ``model.default`` and *fallback_model* sets the model of
+    the first entry in the fallback chain, both on the default profile; the
+    default profile's model config is then propagated to every other profile
+    so a change lands everywhere at once. Only model-related keys are touched
+    — notably not gateway.platforms or credentials, which a per-user profile
+    must not inherit.
+
+    Pass ``wx_only=True`` to limit propagation to the wx_* profiles.
     """
     default_cfg_path = os.path.join(HERMES_HOME, "config.yaml")
-    result: Dict[str, Any] = {"model": None, "updated": [], "unchanged": [], "errors": [], "backup": None}
+    result: Dict[str, Any] = {
+        "model": None, "fallback": None,
+        "updated": [], "unchanged": [], "errors": [], "backup": None,
+    }
 
     try:
         default_cfg = _load_yaml(default_cfg_path)
@@ -1050,26 +1087,48 @@ def set_model_everywhere(model_id: Optional[str] = None) -> Dict[str, Any]:
         shutil.copy2(path, os.path.join(backup_dir, f"{name}.config.yaml"))
         result["backup"] = backup_dir
 
+    default_changed: List[str] = []
+
     if model_id:
         node = default_cfg.get("model")
         if not isinstance(node, dict):
             node = default_cfg["model"] = {}
         if node.get("default") != model_id:
-            try:
-                _backup("default", default_cfg_path)
-                node["default"] = model_id
-                _dump_yaml(default_cfg_path, default_cfg)
-                result["updated"].append(("default", ["model.default"]))
-            except Exception as e:
-                result["errors"].append(f"写入默认配置失败: {e}")
-                return result
+            node["default"] = model_id
+            default_changed.append("model.default")
+
+    if fallback_model:
+        chain = default_cfg.get("fallback_providers")
+        if isinstance(chain, list) and chain and isinstance(chain[0], dict):
+            if chain[0].get("model") != fallback_model:
+                chain[0]["model"] = fallback_model
+                default_changed.append("fallback_providers[0].model")
+            if len(chain) > 1:
+                result["errors"].append(
+                    f"备用链有 {len(chain)} 项，只改了第 1 项；其余请用 hermes fallback 处理"
+                )
         else:
-            result["unchanged"].append("default")
+            result["errors"].append("默认配置没有可用的 fallback_providers 链，未设置备用模型")
+
+    if default_changed:
+        try:
+            _backup("default", default_cfg_path)
+            _dump_yaml(default_cfg_path, default_cfg)
+            result["updated"].append(("default", default_changed))
+        except Exception as e:
+            result["errors"].append(f"写入默认配置失败: {e}")
+            return result
+    elif model_id or fallback_model:
+        result["unchanged"].append("default")
 
     model_cfg = _extract_model_config(default_cfg)
     result["model"] = (default_cfg.get("model") or {}).get("default")
+    chain = default_cfg.get("fallback_providers")
+    if isinstance(chain, list) and chain and isinstance(chain[0], dict):
+        result["fallback"] = chain[0].get("model")
 
-    for name, path in wx_profile_configs():
+    targets = wx_profile_configs() if wx_only else all_profile_configs()
+    for name, path in targets:
         try:
             cfg = _load_yaml(path)
             changed = _apply_model_config(cfg, model_cfg)
