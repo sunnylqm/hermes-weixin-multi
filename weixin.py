@@ -271,20 +271,41 @@ _ADMIN_COMMANDS = frozenset(
         "/wechat-users", "/wechat_users",
         "/approve_wechat", "/approve-wechat",
         "/reject_wechat", "/reject-wechat",
+        "/wechat-model", "/wechat_model",
     }
 )
 
+# Model selection is an admin decision that applies to every user at once, so
+# the built-in commands that would let a single WeChat user change it for
+# themselves are refused. Reading is deliberately still allowed: /status
+# reports the current model, and is not in this set.
+_MODEL_COMMANDS = frozenset({"/model", "/fast", "/reasoning"})
+
 ADMIN_COMMAND_REFUSAL = "❌ 该命令为管理员命令，仅限管理员在 Telegram 渠道使用。"
+
+MODEL_COMMAND_REFUSAL = (
+    "❌ 模型由管理员统一设置，对所有用户一致，无法单独更改。\n"
+    "💡 发送 /status 可查看当前使用的模型。"
+)
+
+
+def _command_head(text: str) -> Optional[str]:
+    """The normalized command word of *text*, or None if it is not a command."""
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+    # Split on whitespace and '@' so "/model@bot gpt-5" is matched too.
+    return stripped.split()[0].split("@", 1)[0].lower()
 
 
 def _is_admin_command(text: str) -> bool:
     """True when *text* invokes one of the Telegram-only management commands."""
-    stripped = (text or "").strip()
-    if not stripped.startswith("/"):
-        return False
-    # Split on whitespace and '@' so "/wechat-login@bot extra args" is caught too.
-    head = stripped.split()[0].split("@", 1)[0].lower()
-    return head in _ADMIN_COMMANDS
+    return _command_head(text) in _ADMIN_COMMANDS
+
+
+def _is_model_command(text: str) -> bool:
+    """True when *text* would let a WeChat user change model settings."""
+    return _command_head(text) in _MODEL_COMMANDS
 
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -1918,9 +1939,16 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             if text and _is_admin_command(text):
                 logger.warning(
                     "[%s] Refused management command from weixin user=%s: %s",
-                    self.name, _safe_id(sender_id), text.strip().split()[0],
+                    self.name, _safe_id(sender_id), _command_head(text),
                 )
                 asyncio.create_task(self.send(effective_chat_id, ADMIN_COMMAND_REFUSAL))
+                return
+            if text and _is_model_command(text):
+                logger.info(
+                    "[%s] Refused model command from weixin user=%s: %s",
+                    self.name, _safe_id(sender_id), _command_head(text),
+                )
+                asyncio.create_task(self.send(effective_chat_id, MODEL_COMMAND_REFUSAL))
                 return
             # ---- End management command check ----
 

@@ -526,6 +526,59 @@ def register(ctx):
             am.send_telegram_notification(f"<pre>{html.escape(body)}</pre>")
         return "✅ 授权状态已发送至 Telegram 管理员会话。"
 
+    def _handle_wechat_model_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        """Show or set the model used by every WeChat user — Telegram admin only.
+
+        WeChat users can read the current model with /status but cannot change
+        it; this is the only way it moves, and it moves for everyone at once.
+        """
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
+
+        arg = (raw_args or "").strip()
+        if not arg:
+            lines = [f"🧠 当前模型：{am.current_model() or '(未配置)'}\n"]
+            for name, path in am.wx_profile_configs():
+                try:
+                    cfg = am._load_yaml(path)
+                    m = (cfg.get("model") or {}).get("default")
+                except Exception:
+                    m = "(读取失败)"
+                flag = "✅" if m == am.current_model() else "⚠️"
+                lines.append(f"  {flag} {name} — {m}")
+            lines.append("\n用 /wechat-model <模型ID> 为所有微信用户统一切换。")
+            body = "\n".join(lines)
+            if verdict == am.ADMIN_OK:
+                return body
+            if am.throttle("wechat-model-show", 30.0):
+                am.send_telegram_notification(f"<pre>{html.escape(body)}</pre>")
+            return "✅ 模型状态已发送至 Telegram 管理员会话。"
+
+        result = am.set_model_everywhere(arg)
+        if result["errors"] and not result["updated"]:
+            return "❌ 切换失败：\n" + "\n".join(result["errors"][:5])
+
+        lines = [f"🧠 已将所有微信用户切换到：{result['model']}"]
+        if result["updated"]:
+            lines.append(f"\n已更新 {len(result['updated'])} 个 profile：")
+            for name, changed in result["updated"]:
+                lines.append(f"  • {name} — {', '.join(changed[:4])}{' …' if len(changed) > 4 else ''}")
+        if result["unchanged"]:
+            lines.append(f"\n{len(result['unchanged'])} 个已是该配置，无需改动。")
+        if result["errors"]:
+            lines.append("\n⚠️ 部分失败：\n" + "\n".join(result["errors"][:5]))
+        if result["backup"]:
+            lines.append(f"\n备份：{result['backup']}")
+        lines.append("\n用户下一轮对话生效；已有会话若曾被 /model 临时覆盖，需 /new 开新会话。")
+        body = "\n".join(lines)
+
+        # State change — always leave an audit trail in the admin chat.
+        if verdict != am.ADMIN_OK:
+            am.send_telegram_notification(f"🧠 <b>模型已统一切换</b>\n<pre>{html.escape(body)}</pre>")
+            return "✅ 已切换，详情已发送至 Telegram 管理员会话。"
+        return body
+
     def _handle_reject_wechat_cmd(raw_args: str = "", *args, **kwargs) -> str:
         am, verdict, denial = _guard(raw_args, *args, **kwargs)
         if denial:
@@ -557,6 +610,16 @@ def register(ctx):
         name="wechat_users",
         handler=_handle_wechat_users_cmd,
         description="查看微信已批准用户与待审批列表",
+    )
+    ctx.register_command(
+        name="wechat-model",
+        handler=_handle_wechat_model_cmd,
+        description="查看/统一切换所有微信用户的模型 (/wechat-model [模型ID])",
+    )
+    ctx.register_command(
+        name="wechat_model",
+        handler=_handle_wechat_model_cmd,
+        description="查看/统一切换所有微信用户的模型",
     )
     ctx.register_command(
         name="reject_wechat",

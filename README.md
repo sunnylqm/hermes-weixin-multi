@@ -110,8 +110,9 @@ hermes gateway restart
 | `/approve_wechat <配对码>` | 批准微信用户加入，并自动创建专属独立 Profile | `/approve_wechat a3f9c1d2` |
 | `/wechat-users` 或 `/wechat_users` | 查看当前已批准用户白名单及待审批列表 | `/wechat-users` |
 | `/reject_wechat <配对码或用户ID>` | 拒绝申请或撤销已有用户授权 | `/reject_wechat a3f9c1d2` |
-| `/wechat-list` | 查看所有已连接的微信机器人账号状态 | `/wechat-list` |
+| `/wechat-list` | 查看所有已连接的微信机器人账号状态（含在线/掉线） | `/wechat-list` |
 | `/wechat-login` | 生成二维码扫码添加新微信号 | `/wechat-login` |
+| `/wechat-model [模型ID]` | 查看各 Profile 当前模型；带参数则为**所有微信用户统一切换** | `/wechat-model claude-opus-5` |
 
 配对码是**高熵一次性凭据**，仅通过 Telegram 审批卡片下发。已验证身份的 Telegram
 管理员可直接用用户 ID 批准/撤销；其他来源必须出示配对码。
@@ -120,7 +121,36 @@ hermes gateway restart
 
 | 指令 / 关键字 | 说明 |
 |------|------|
+| `/status` | 查看当前模型与会话信息（**只读**） |
 | `/unregister`、`/delete-account`、`注销账号`、`清除我的数据` | **主动注销并物理删除**用户的专属 Profile 目录、所有对话历史与长期记忆 |
+
+---
+
+## 🧠 模型统一管控 / Uniform Model Control
+
+**微信用户可看不可改**：`/status` 照常显示当前模型，但 `/model`、`/fast`、`/reasoning`
+会被适配器在入站阶段拒绝并提示改用 `/status`。模型只能由 Telegram 管理员通过
+`/wechat-model <模型ID>` 更改，且一次对所有人生效。
+
+之所以需要这样做：Hermes 的 `load_config()` 从 **profile 作用域**的 `HERMES_HOME` 读
+`config.yaml`，profile 配置是**整体替换** default 而非合并 —— 没有继承。每个微信用户
+一个 profile，就意味着一份独立的模型配置副本。而内置 `/model` 是「会话级；`--global`
+持久化」，用户可以自行改掉自己那份。
+
+`/wechat-model` 把 default profile 的模型配置写入所有 `wx_*` profile，同步范围：
+
+| 同步 | 不同步 |
+|---|---|
+| `model`（含 `default` / `provider`） | `gateway.platforms`、任何凭据 |
+| `fallback_providers`、`custom_providers` | 记忆、会话、`USER.md` |
+| `auxiliary.*.model`、`delegation.model` | 其它一切无关配置 |
+| `agent.reasoning_effort` | |
+
+> 只带模型 ID 无法运行 —— 它要靠 provider 条目解析，所以 provider 配置随行。
+> 每次改动前会把涉及的 config.yaml 备份到 `~/.hermes/weixin/model-sync-<时间戳>/`。
+>
+> ⚠️ 切换在用户**下一轮对话**生效。若某个会话此前被 `/model` 临时覆盖过（会话级覆盖
+> 存在网关的 `_session_model_overrides` 里），该会话需 `/new` 重开才会跟随。
 
 ---
 

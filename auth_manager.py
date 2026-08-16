@@ -911,6 +911,185 @@ def reject_user_request(identifier: str, allow_user_id: bool = True) -> Tuple[bo
         return True, f"已成功拒绝/移除用户或申请: {identifier}"
     return False, f"未找到相关用户或申请: {identifier}"
 
+# ── Model configuration ──
+# Model choice is an admin decision that must apply to every WeChat user at
+# once. Hermes gives each profile a standalone config.yaml (load_config() reads
+# the profile-scoped HERMES_HOME; there is no merge with the default profile),
+# so "apply to everyone" means writing the same model config into the default
+# profile and every wx_* profile.
+#
+# A model id alone is not enough to run: it resolves through provider entries,
+# so those travel with it. Reasoning effort rides along because /reasoning is
+# likewise admin-controlled.
+
+_MODEL_TOP_LEVEL_KEYS = ("model", "fallback_providers", "custom_providers")
+
+
+def _profiles_dir() -> str:
+    return os.path.join(HERMES_HOME, "profiles")
+
+
+def wx_profile_configs() -> List[Tuple[str, str]]:
+    """(profile_name, config_path) for every wx_* profile that has a config."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(_profiles_dir(), "wx_*"))):
+        cfg = os.path.join(d, "config.yaml")
+        if os.path.isfile(cfg):
+            out.append((os.path.basename(d), cfg))
+    return out
+
+
+def _load_yaml(path: str) -> dict:
+    import yaml
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _dump_yaml(path: str, data: dict) -> None:
+    import yaml
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _extract_model_config(cfg: dict) -> dict:
+    """The model-related subset of a Hermes config."""
+    out = {k: cfg[k] for k in _MODEL_TOP_LEVEL_KEYS if k in cfg}
+    aux = cfg.get("auxiliary")
+    if isinstance(aux, dict):
+        sub = {n: s["model"] for n, s in aux.items() if isinstance(s, dict) and "model" in s}
+        if sub:
+            out["auxiliary"] = sub
+    for parent, key in (("delegation", "model"), ("agent", "reasoning_effort")):
+        node = cfg.get(parent)
+        if isinstance(node, dict) and key in node:
+            out.setdefault(parent, {})[key] = node[key]
+    return out
+
+
+def _apply_model_config(cfg: dict, model_cfg: dict) -> List[str]:
+    """Merge *model_cfg* into *cfg* in place. Returns the changed key paths."""
+    import copy
+    changed: List[str] = []
+
+    for key in _MODEL_TOP_LEVEL_KEYS:
+        if key in model_cfg and cfg.get(key) != model_cfg[key]:
+            cfg[key] = copy.deepcopy(model_cfg[key])
+            changed.append(key)
+
+    if "auxiliary" in model_cfg:
+        node = cfg.get("auxiliary")
+        if not isinstance(node, dict):
+            node = cfg["auxiliary"] = {}
+        for name, value in model_cfg["auxiliary"].items():
+            entry = node.get(name)
+            if not isinstance(entry, dict):
+                entry = node[name] = {}
+            if entry.get("model") != value:
+                entry["model"] = value
+                changed.append(f"auxiliary.{name}.model")
+
+    for parent in ("delegation", "agent"):
+        if parent not in model_cfg:
+            continue
+        node = cfg.get(parent)
+        if not isinstance(node, dict):
+            node = cfg[parent] = {}
+        for key, value in model_cfg[parent].items():
+            if node.get(key) != value:
+                node[key] = value
+                changed.append(f"{parent}.{key}")
+
+    return changed
+
+
+def current_model() -> Optional[str]:
+    """The model the default profile is configured with."""
+    try:
+        cfg = _load_yaml(os.path.join(HERMES_HOME, "config.yaml"))
+    except Exception as e:
+        logger.warning("[Weixin Auth] Could not read default config: %s", e)
+        return None
+    model = cfg.get("model")
+    return model.get("default") if isinstance(model, dict) else None
+
+
+def set_model_everywhere(model_id: Optional[str] = None) -> Dict[str, Any]:
+    """Point every WeChat user at the same model.
+
+    With *model_id*, sets ``model.default`` on the default profile first;
+    either way the default profile's model config is then propagated to every
+    wx_* profile so a change lands for all users at once. Only model-related
+    keys are touched — notably not gateway.platforms or credentials, which a
+    per-user profile must not inherit.
+    """
+    default_cfg_path = os.path.join(HERMES_HOME, "config.yaml")
+    result: Dict[str, Any] = {"model": None, "updated": [], "unchanged": [], "errors": [], "backup": None}
+
+    try:
+        default_cfg = _load_yaml(default_cfg_path)
+    except Exception as e:
+        result["errors"].append(f"读取默认配置失败: {e}")
+        return result
+
+    backup_dir = os.path.join(AUTH_DIR, f"model-sync-{time.strftime('%Y%m%d-%H%M%S')}")
+
+    def _backup(name: str, path: str) -> None:
+        os.makedirs(backup_dir, exist_ok=True)
+        os.chmod(backup_dir, 0o700)
+        shutil.copy2(path, os.path.join(backup_dir, f"{name}.config.yaml"))
+        result["backup"] = backup_dir
+
+    if model_id:
+        node = default_cfg.get("model")
+        if not isinstance(node, dict):
+            node = default_cfg["model"] = {}
+        if node.get("default") != model_id:
+            try:
+                _backup("default", default_cfg_path)
+                node["default"] = model_id
+                _dump_yaml(default_cfg_path, default_cfg)
+                result["updated"].append(("default", ["model.default"]))
+            except Exception as e:
+                result["errors"].append(f"写入默认配置失败: {e}")
+                return result
+        else:
+            result["unchanged"].append("default")
+
+    model_cfg = _extract_model_config(default_cfg)
+    result["model"] = (default_cfg.get("model") or {}).get("default")
+
+    for name, path in wx_profile_configs():
+        try:
+            cfg = _load_yaml(path)
+            changed = _apply_model_config(cfg, model_cfg)
+            if not changed:
+                result["unchanged"].append(name)
+                continue
+            _backup(name, path)
+            _dump_yaml(path, cfg)
+            result["updated"].append((name, changed))
+        except Exception as e:
+            logger.error("[Weixin Auth] Failed to sync model config into %s: %s", name, e)
+            result["errors"].append(f"{name}: {e}")
+
+    logger.info(
+        "[Weixin Auth] Model sync -> %s; updated=%d unchanged=%d errors=%d",
+        result["model"], len(result["updated"]), len(result["unchanged"]), len(result["errors"]),
+    )
+    return result
+
+
 CALLBACK_PREFIX = "wx:"
 
 
