@@ -1,8 +1,8 @@
 <div align="center">
   <h1>🤖 Hermes Weixin Multi</h1>
-  <p><strong>多账号微信接入插件 · Multi-Account WeChat Plugin for Hermes Agent</strong></p>
-  <p>基于腾讯 iLink Bot API，让你的 Hermes Agent 同时接入 <b>无限个微信账号</b>。<br>
-  <em>Connect unlimited WeChat accounts to your Hermes Agent via Tencent iLink Bot API.</em></p>
+  <p><strong>多账号微信接入 & 独立用户记忆与审批插件 · Multi-Account WeChat Plugin for Hermes Agent</strong></p>
+  <p>基于腾讯 iLink Bot API，让你的 Hermes Agent 同时接入 <b>无限个微信账号</b>，并为每个微信用户提供<b>完全独立的专属 Profile 与长期记忆隔离</b>。<br>
+  <em>Connect unlimited WeChat accounts to Hermes Agent with per-user isolated profiles, interactive Telegram admin approval, and proactive welcome greetings.</em></p>
 </div>
 
 <p align="center">
@@ -19,12 +19,36 @@
 |------|:------------:|:-------------------:|
 | 多账号支持 / Multi-account | ❌ 单账号 | ✅ 无限账号，动态添加 |
 | QR 扫码登录 / QR Login | ❌ CLI 本地 | ✅ 任何渠道（微信/Telegram/WebUI/CLI） |
+| 独立 Profile 与记忆物理隔离 | ❌ 全局共享记忆 | ✅ **每个用户自动开通专属 Profile 与独立记忆** |
+| Telegram 管理员审批 | ❌ 仅配对码/白名单 | ✅ **Telegram 交互式按钮卡片直接批准/拒绝** |
+| 主动欢迎引导语 | ❌ 被动应答 | ✅ **批准后主动推送欢迎语，引导用户介绍称呼** |
+| 用户主动注销清空数据 | ❌ 无 | ✅ **发送 `/unregister` 或 `注销账号` 物理删除数据** |
 | 扫码自动重试 / Auto Retry | ❌ 过期需重发 | ✅ 自动刷新 3 次 |
-| 全局命令 / Slash Commands | ❌ | ✅ `/wechat-login`、`/wechat-list` |
+| 全局管理命令 / Commands | ❌ | ✅ `/wechat-login`、`/wechat-list`、`/approve_wechat`、`/wechat-users` |
 | 消息收发 / Media Support | 基础文本 | ✅ 文本/图片/视频/文件/语音 |
-| 错误反馈 / Error Feedback | 静默失败 | ✅ 超时/限流提示 |
 | WebUI 状态 / Status Display | ❌ | ✅ 账号在线状态 |
 | 独立轮询 / Independent Polling | ❌ 单线程 | ✅ 每账号独立线程 |
+
+---
+
+## 🔒 独立用户画像与审批工作流
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor W as 微信新用户
+    participant H as Hermes 机器人
+    actor T as Telegram 管理员
+
+    W->>H: 扫码/首次发送消息
+    H->>W: 礼貌回复：“您好！消息已收到，系统正在为您接入，请稍候~”
+    H->>T: 发送交互卡片（展示用户ID、留言内容及按钮）
+    T->>H: 点击 [ ✅ 批准加入 ] 或输入 /approve_wechat
+    H-->>T: 弹出提示“✅ 已批准该用户并开通专属 Profile”
+    H->>W: 🤖 主动推送欢迎语：“👋 您好！很高兴与您相遇。我是您的专属 AI 助理，请问我应该怎么称呼你呢？😊”
+    W->>H: 回复自己的称呼（如：“叫我小明就行”）
+    Note over H,W: AI 自动识别并将称呼与偏好持久化到该用户的专属 USER.md 中
+```
 
 ---
 
@@ -33,22 +57,22 @@
 ### 前置条件 / Prerequisites
 
 - 已安装 [Hermes Agent](https://hermes-agent.nousresearch.com)
-- Python 依赖：`aiohttp`、`cryptography`、`qrcode[pil]`
+- Python 依赖：`aiohttp`、`cryptography`、`qrcode[pil]`、`requests`
 
 ```bash
-pip install aiohttp cryptography 'qrcode[pil]'
+pip install aiohttp cryptography 'qrcode[pil]' requests
 ```
 > ⚠️ Linux/macOS 必须加引号 `'qrcode[pil]'`，Windows 不需要。
 
 ### 1. 克隆插件 / Clone Plugin
 
 ```bash
-git clone https://github.com/hyonex/hermes-weixin-multi.git ~/.hermes/plugins/weixin-multi
+git clone https://github.com/sunnylqm/hermes-weixin-multi.git ~/.hermes/plugins/weixin-multi
 ```
 
 ### 2. 启用插件 / Enable Plugin
 
-在 `~/.hermes/config.yaml` 中添加 / Add to your `config.yaml`:
+在 `~/.hermes/config.yaml` 中添加：
 
 ```yaml
 plugins:
@@ -56,189 +80,71 @@ plugins:
     - weixin-multi
 
 gateway:
+  multiplex_profiles: true
   platforms:
     weixin_multi:
       enabled: true
       extra:
-        dm_policy: open          # 私聊策略 / DM policy
-        group_policy: disabled   # 群聊策略 / Group policy
+        dm_policy: open
+        allow_all_users: true
 ```
 
-### 3. 重启 Gateway / Restart Gateway
-
+重启 Gateway：
 ```bash
 hermes gateway restart
 ```
 
 ---
 
-## 🚀 使用方法 / Usage
+## 💬 管理员与用户指令
 
-### 添加微信账号 / Add WeChat Account
+### Telegram 管理员指令
 
-根据你使用的界面不同，操作方式也不同：
+| 指令 | 说明 | 示例 |
+|------|------|------|
+| `/approve_wechat <配对码或用户ID>` | 批准微信用户加入，并自动创建专属独立 Profile | `/approve_wechat 123456` |
+| `/wechat-users` 或 `/wechat_users` | 查看当前已批准用户白名单及待审批列表 | `/wechat-users` |
+| `/reject_wechat <配对码或用户ID>` | 拒绝申请或撤销已有用户授权 | `/reject_wechat 123456` |
+| `/wechat-list` | 查看所有已连接的微信机器人账号状态 | `/wechat-list` |
+| `/wechat-login` | 生成二维码扫码添加新微信号 | `/wechat-login` |
 
-**方式一：在微信/Telegram 聊天中（推荐）**
-发送斜杠命令即可：
-```
-/wechat-login
-```
-插件会生成二维码，用微信扫码并确认即可自动添加。
-*Send `/wechat-login` in any connected WeChat or Telegram chat.*
+### 微信用户指令
 
-**方式二：在 Hermes WebUI 或 Desktop 中**
-直接输入文字告诉 AI 你要添加微信账号，例如：
-```
-帮我添加一个微信账号
-```
-或者：
-```
-运行微信登录
-```
-AI 会自动调用 `wechat_login` 工具生成二维码。
-
-### 查看账号列表 / List Accounts
-
-**在微信/Telegram 中：**
-```
-/wechat-list
-```
-**在 WebUI/Desktop 中：**
-```
-查看微信账号列表
-```
-
-示例输出 / Example output:
-
-```
-📱 Weixin Multi 账号列表：
-  ✅ wechat-1 — 🟢 轮询中 / polling
-  ✅ wechat-2 — 🟢 轮询中 / polling
-
-共 2 个账号 / Total 2 accounts
-发送 /wechat-login 添加新账号
-```
-
-### 删除账号 / Remove Account
-
-```bash
-rm ~/.hermes/weixin/accounts/wechat-N.json
-hermes gateway restart
-```
+| 指令 / 关键字 | 说明 |
+|------|------|
+| `/unregister`、`/delete-account`、`注销账号`、`清除我的数据` | **主动注销并物理删除**用户的专属 Profile 目录、所有对话历史与长期记忆 |
 
 ---
 
-## 🏗️ 多账号架构 / Architecture
+## 🏗️ 架构与数据隔离 / Architecture
 
 ```
-Gateway (单进程 / Single Process)
-├── wechat-1 → iLink Bot API → 📱 微信号 A / Account A
-├── wechat-2 → iLink Bot API → 📱 微信号 B / Account B
-└── wechat-N → iLink Bot API → 📱 微信号 N / Account N
+Gateway (单进程)
+├── wechat-1 ── iLink API ── 📱 微信号 A
+└── wechat-2 ── iLink API ── 📱 微信号 B
+
+用户数据存储 (物理隔离)
+├── ~/.hermes/profiles/wx_<用户A>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
+└── ~/.hermes/profiles/wx_<用户B>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
 ```
 
-每个账号**完全独立** / Each account is **fully independent**:
-
-- ✅ 独立 iLink token / Independent token
-- ✅ 独立异步轮询线程 / Independent async polling
-- ✅ 独立消息收发 / Independent messaging
-- ✅ 独立会话管理 / Independent session management
+- ✅ **每个微信用户拥有独立的专属 Profile 目录**
+- ✅ **用户间的个人画像（`USER.md`）与长期记忆（`MEMORY.md`）物理隔离，绝不串味**
+- ✅ **支持 Telegram 实时卡片审批与一键批准**
+- ✅ **用户随时可发送 `注销` 彻底物理销毁自身数据**
 
 ---
 
-## ⚙️ 配置参考 / Configuration
+## ⚙️ 配置与存储路径 / Configuration
 
-### 账号文件 / Account File
-
-存储位置：`~/.hermes/weixin/accounts/wechat-N.json`
-
-```json
-{
-  "token": "***",
-  "base_url": "https://ilinkai.weixin.qq.com",
-  "cdn_base_url": "https://cdn2.weixin.qq.com"
-}
-```
-
-### 环境变量 / Environment Variables
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `WEIXIN_MULTI_DM_POLICY` | 私聊策略 / DM policy | `open` |
-| `WEIXIN_MULTI_ALLOWED_USERS` | 允许的用户 ID / Allowed user IDs | — |
-| `WEIXIN_MULTI_BASE_URL` | API 地址 / API base URL | `https://ilinkai.weixin.qq.com` |
-
----
-
-## ❓ 常见问题 / FAQ
-
-### QR 码过期 / QR Code Expired
-
-有效期约 5 分钟。插件会自动刷新最多 3 次，超时后重新发 `/wechat-login`。
-*Valid for ~5 min. Auto-refreshes up to 3 times. Re-send `/wechat-login` if expired.*
-
-### Token 过期 / Token Expired
-
-iLink token 有时效性，过期后轮询静默失败（errcode=-14）。重新扫码即可。
-*iLink tokens expire — polling silently fails (errcode=-14). Re-scan to refresh.*
-
-### 消息发送失败 / Message Send Failed
-
-```bash
-journalctl --user -u hermes-gateway --since "5 min ago"
-```
-
-常见原因 / Common causes:
-- Token 过期 / Token expired → 重新扫码 / re-scan
-- 模型限流 429 / Rate limit → 等待或切换模型 / wait or switch model
-- 网络问题 / Network → 检查代理配置 / check proxy config
-
----
-
-## 🧑‍💻 开发 / Development
-
-### 代码结构 / Code Structure
-
-```
-hermes-weixin-multi/
-├── adapter.py       # 插件适配器（注册、命令、状态）Plugin adapter
-├── weixin.py        # 核心逻辑（消息收发、媒体处理）Core logic
-├── plugin.yaml      # 插件元数据 / Plugin metadata
-├── screenshots/     # 功能截图 / Screenshots
-└── README.md        # 本文件 / This file
-```
-
-### 修改后同步 / Sync After Changes
-
-```bash
-cp adapter.py weixin.py ~/.hermes/plugins/weixin-multi/
-find ~/.hermes/plugins/weixin-multi/ -name "*.pyc" -delete
-hermes gateway restart
-```
+- **已授权白名单**：`~/.hermes/weixin/approved_users.json`
+- **待审批申请列表**：`~/.hermes/weixin/pending_requests.json`
+- **微信账号凭证**：`~/.hermes/weixin/accounts/*.json`
+- **用户独立 Profile**：`~/.hermes/profiles/wx_<user_id>/`
 
 ---
 
 ## 📄 许可证 / License
 
-本项目基于 [Hermes Agent](https://github.com/nousresearch/hermes-agent)（https://github.com/nousresearch/hermes-agent）的 weixin.py 修改而来。
-*This project is a fork of the `weixin.py` platform adapter from [Hermes Agent](https://github.com/nousresearch/hermes-agent) (https://github.com/nousresearch/hermes-agent).*
-
-**原项目 / Original:** [NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent) · MIT License © 2025 Nous Research  
-**本修改版 / This fork:** GNU Affero General Public License v3.0 (AGPL-3.0)
-
-- ✅ 个人学习、研究可自由使用 / Free for personal & research use
-- ✅ 修改后的代码**必须开源** / Modifications **must be open-sourced** (AGPL)
-- ✅ 引用或再分发需注明来源 / Attribution required for redistribution
-- ❌ 商业使用需谨慎（AGPL 传染性） / Commercial use: AGPL is copyleft
-
-详见 / See [LICENSE](LICENSE) 文件。
-
----
-
-<div align="center">
-  <p>Made with ❤️ by <a href="https://github.com/hyonex">hyonex</a></p>
-  <p>
-    <a href="https://github.com/hyonex/hermes-weixin-multi">GitHub</a> ·
-    <a href="https://gitee.com/hyonex/hermes-weixin-multi">Gitee</a>
-  </p>
-</div>
+本项目基于 [Hermes Agent](https://github.com/nousresearch/hermes-agent) 与 [hyonex/hermes-weixin-multi](https://github.com/hyonex/hermes-weixin-multi) 修改而来。
+**许可证：** GNU Affero General Public License v3.0 (AGPL-3.0)

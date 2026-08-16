@@ -1825,12 +1825,43 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             # Record chat→account mapping for replies
             self._chat_to_account[effective_chat_id] = account_id
 
+            # ---- Unregister / Delete Account Check for WeChat DMs ----
+            if chat_type == "dm" and sender_id and text:
+                clean_cmd = text.strip().lower()
+                if clean_cmd in ["/unregister", "/delete-account", "/reset-memory", "注销", "注销账号", "注销账户", "清除我的数据", "清空我的数据", "彻底注销"]:
+                    try:
+                        import auth_manager
+                    except ImportError:
+                        from . import auth_manager
+                    success, reply_msg = auth_manager.unregister_user(sender_id)
+                    asyncio.create_task(self.send(effective_chat_id, reply_msg))
+                    return
+            # ---- End Unregister Check ----
+
+            # ---- Telegram Admin Approval Check for WeChat DMs ----
+            if chat_type == "dm" and sender_id:
+                try:
+                    import auth_manager
+                except ImportError:
+                    from . import auth_manager
+                if not auth_manager.is_user_approved(sender_id):
+                    code, is_new = auth_manager.create_pending_request(
+                        sender_id, account_id=account_id, initial_text=text
+                    )
+                    reply_text = "您好！消息已收到，系统正在为您接入，请稍候~"
+                    logger.info("[%s] Unapproved user=%s holding, pending code=%s", self.name, sender_id, code)
+                    asyncio.create_task(self.send(effective_chat_id, reply_text))
+                    return
+            # ---- End Approval Check ----
+
             source = self.build_source(
                 chat_id=effective_chat_id,
                 chat_type=chat_type,
                 user_id=sender_id,
                 user_name=sender_id,
             )
+            if not source.profile and sender_id and chat_type == "dm":
+                source.profile = self._get_or_create_user_profile(sender_id)
             event = MessageEvent(
                 text=text,
                 message_type=_message_type_from_media(media_types, text),
@@ -1845,6 +1876,31 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         finally:
             pass  # account_id passed through params, no cleanup needed
+
+    def _get_or_create_user_profile(self, user_id: str) -> str:
+        """Auto-create an independent Hermes profile for a user if not exists."""
+        from hermes_cli.profiles import create_profile, profile_exists
+        raw_id = user_id.split('@')[0] if '@' in user_id else user_id
+        clean_id = re.sub(r'[^a-zA-Z0-9_]', '_', raw_id).lower()[:26]
+        profile_name = f"wx_{clean_id}"
+        try:
+            if not profile_exists(profile_name):
+                logger.info("[%s] Auto-creating independent profile for user=%s -> %s", self.name, user_id, profile_name)
+                pdir = create_profile(profile_name, clone_from="default", clone_config=True, no_alias=True)
+                mem_dir = os.path.join(pdir, "memories")
+                os.makedirs(mem_dir, exist_ok=True)
+                with open(os.path.join(mem_dir, "USER.md"), "w") as uf:
+                    uf.write("_Learn about the person you\'re helping. Update this as you go.\n§\n**Name:**\n§\n**What to call them:**\n§\n**Pronouns:** _(optional)_\n§\n**Timezone:**\n§\n**Notes:**\n")
+                with open(os.path.join(mem_dir, "MEMORY.md"), "w") as mf:
+                    mf.write("")
+            return profile_name
+        except Exception as e:
+            logger.error("[%s] Failed to auto-create profile %s: %s", self.name, profile_name, e)
+            return "weixin"
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        return True
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":

@@ -333,6 +333,82 @@ def register(ctx):
         description="查看所有微信账号状态",
     )
 
+    # ── Telegram User Approval Commands ──
+    async def _handle_approve_wechat_cmd(raw_args: str) -> str:
+        arg = (raw_args or "").strip()
+        if not arg:
+            return "❌ 请输入申请配对码或微信用户 ID。\n例如：/approve_wechat 123456"
+        try:
+            import auth_manager
+        except ImportError:
+            from . import auth_manager
+        success, msg, target_user, account_id = auth_manager.approve_user_request(arg)
+        return msg
+
+    def _handle_wechat_users_cmd(raw_args: str) -> str:
+        try:
+            import auth_manager
+        except ImportError:
+            from . import auth_manager
+        status = auth_manager.list_auth_status()
+        approved = status.get("approved", {})
+        pending = status.get("pending", {})
+        
+        lines = ["👥 微信用户授权状态：\n"]
+        lines.append(f"【已批准用户 ({len(approved)})】")
+        for u, meta in approved.items():
+            lines.append(f"  ✅ {u}")
+            
+        lines.append(f"\n【待审批申请 ({len(pending)})】")
+        for code, info in pending.items():
+            lines.append(f"  ⏳ 配对码: {code} | 用户: {info.get('user_id')}")
+            
+        if pending:
+            lines.append("\n👉 输入 /approve_wechat <配对码> 即可批准。")
+        return "\n".join(lines)
+
+    def _handle_reject_wechat_cmd(raw_args: str) -> str:
+        arg = (raw_args or "").strip()
+        if not arg:
+            return "❌ 请输入申请配对码或微信用户 ID。\n例如：/reject_wechat 123456"
+        try:
+            import auth_manager
+        except ImportError:
+            from . import auth_manager
+        success, msg = auth_manager.reject_user_request(arg)
+        return msg
+
+    ctx.register_command(
+        name="approve_wechat",
+        handler=_handle_approve_wechat_cmd,
+        description="批准微信新用户配对申请 (/approve_wechat <申请码|用户ID>)",
+    )
+    ctx.register_command(
+        name="approve-wechat",
+        handler=_handle_approve_wechat_cmd,
+        description="批准微信新用户配对申请",
+    )
+    ctx.register_command(
+        name="wechat-users",
+        handler=_handle_wechat_users_cmd,
+        description="查看微信已批准用户与待审批列表",
+    )
+    ctx.register_command(
+        name="wechat_users",
+        handler=_handle_wechat_users_cmd,
+        description="查看微信已批准用户与待审批列表",
+    )
+    ctx.register_command(
+        name="reject_wechat",
+        handler=_handle_reject_wechat_cmd,
+        description="拒绝或移除微信用户授权 (/reject_wechat <申请码|用户ID>)",
+    )
+    ctx.register_command(
+        name="reject-wechat",
+        handler=_handle_reject_wechat_cmd,
+        description="拒绝或移除微信用户授权",
+    )
+
     # ── Register as agent tools (works in WebUI/Desktop where commands bypass gateway) ──
     ctx.register_tool(
         name="wechat_login",
