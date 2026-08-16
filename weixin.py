@@ -1848,8 +1848,8 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                     code, is_new = auth_manager.create_pending_request(
                         sender_id, account_id=account_id, initial_text=text
                     )
-                    reply_text = "您好！消息已收到，系统正在为您接入，请稍候~"
-                    logger.info("[%s] Unapproved user=%s holding, pending code=%s", self.name, sender_id, code)
+                    reply_text = getattr(auth_manager, "WELCOME_ON_SCAN_TEXT", "👋 您好！很高兴与您相遇。我是您的专属 AI 助理。\n\n📌 请问我应该怎么称呼你呢？（您可以直接回复您的称呼或姓名）\n\n💡 隐私与数据说明：\n系统将为您提供专属独立 Profile 与物理记忆隔离。如需注销账号并彻底清空所有个人画像、记忆与对话数据，您可以随时发送【注销】或【/unregister】。\n\n⏳ 系统正在为您接入中，请稍候...")
+                    logger.info("[%s] Unapproved user=%s holding with welcome greeting, pending code=%s", self.name, sender_id, code)
                     asyncio.create_task(self.send(effective_chat_id, reply_text))
                     return
             # ---- End Approval Check ----

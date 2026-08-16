@@ -18,12 +18,24 @@ AUTH_DIR = os.path.join(HERMES_HOME, "weixin")
 APPROVED_FILE = os.path.join(AUTH_DIR, "approved_users.json")
 PENDING_FILE = os.path.join(AUTH_DIR, "pending_requests.json")
 
-DEFAULT_WELCOME_TEXT = """👋 您好！很高兴与您相遇。我是您的专属 AI 助理。
+WELCOME_ON_SCAN_TEXT = """👋 您好！很高兴与您相遇。我是您的专属 AI 助理。
 
 📌 请问我应该怎么称呼你呢？（您可以直接回复您的称呼或姓名）
 
 💡 隐私与数据说明：
-系统已为您自动开通专属独立 Profile 与物理记忆隔离。如需注销账号并清空所有个人画像、记忆与对话数据，您可以随时发送【注销】或【/unregister】。"""
+系统将为您提供专属独立 Profile 与物理记忆隔离。如需注销账号并彻底清空所有个人画像、记忆与对话数据，您可以随时发送【注销】或【/unregister】。
+
+⏳ 系统正在为您接入中，请稍候..."""
+
+APPROVED_COMMANDS_TEXT = """🎉 您的接入申请已获批准，专属独立空间已就绪！
+
+🛠️ 常用指令说明：
+• /commands — 查看所有可用命令与功能清单
+• /new — 开启一段全新会话（重置当前上下文）
+• /status — 查看当前 AI 状态、模型与系统信息
+• /unregister 或发送【注销】 — 随时彻底清空所有记忆并注销账号
+
+现在您可以直接向我发送任何消息，开始对话了！😊"""
 
 # Default admin IDs that are pre-approved
 DEFAULT_APPROVED = [
@@ -172,8 +184,8 @@ def send_telegram_approval_card(
         logger.error("[Weixin Auth] Error sending Telegram approval card: %s", e)
     return False
 
-def send_wechat_welcome_message(user_id: str, account_id: Optional[str] = None, text: str = DEFAULT_WELCOME_TEXT) -> bool:
-    """Proactively send a welcome message with robust account discovery and fallback."""
+def send_wechat_message(user_id: str, account_id: Optional[str] = None, text: str = APPROVED_COMMANDS_TEXT) -> bool:
+    """Proactively send a message to a WeChat user with robust account discovery."""
     try:
         import requests
         accounts_dir = os.path.join(HERMES_HOME, "weixin", "accounts")
@@ -218,7 +230,7 @@ def send_wechat_welcome_message(user_id: str, account_id: Optional[str] = None, 
                     "msg": {
                         "from_user_id": "",
                         "to_user_id": user_id,
-                        "client_id": f"hermes-welcome-{uuid.uuid4().hex}",
+                        "client_id": f"hermes-msg-{uuid.uuid4().hex}",
                         "message_type": 2,
                         "message_state": 2,
                         "item_list": [{"type": 1, "text_item": {"text": text}}]
@@ -231,17 +243,20 @@ def send_wechat_welcome_message(user_id: str, account_id: Optional[str] = None, 
                 resp = requests.post(url, json=payload, headers=headers, timeout=10)
                 data = resp.json() if resp.status_code == 200 else {}
                 if resp.status_code == 200 and data.get("ret") in (0, None):
-                    logger.info("[Weixin Auth] Successfully sent welcome message to %s using %s", user_id, os.path.basename(account_file))
+                    logger.info("[Weixin Auth] Successfully sent message to %s using %s", user_id, os.path.basename(account_file))
                     return True
                 else:
-                    logger.warning("[Weixin Auth] Send welcome using %s returned %s: %s", os.path.basename(account_file), resp.status_code, resp.text)
+                    logger.warning("[Weixin Auth] Send message using %s returned %s: %s", os.path.basename(account_file), resp.status_code, resp.text)
             except Exception as e:
                 logger.warning("[Weixin Auth] Error trying account %s: %s", account_file, e)
 
         return False
     except Exception as e:
-        logger.error("[Weixin Auth] Failed to send welcome message to %s: %s", user_id, e)
+        logger.error("[Weixin Auth] Failed to send message to %s: %s", user_id, e)
         return False
+
+# Backward-compat alias
+send_wechat_welcome_message = send_wechat_message
 
 def create_pending_request(
     user_id: str,
@@ -297,7 +312,7 @@ def create_pending_request(
 
 def approve_user_request(identifier: str, approver: str = "telegram_admin") -> Tuple[bool, str, Optional[str], Optional[str]]:
     """
-    Approve a user by pairing code OR user_id, creating profile and pushing welcome greeting.
+    Approve a user by pairing code OR user_id, creating profile and pushing approved command guide.
     Returns (success, message, user_id, account_id).
     """
     init_auth_store()
@@ -368,10 +383,10 @@ def approve_user_request(identifier: str, approver: str = "telegram_admin") -> T
     except Exception as e:
         logger.error("[Weixin Auth] Error creating profile for approved user: %s", e)
 
-    # Proactively push welcome message with greeting and unregister instructions
-    send_wechat_welcome_message(target_user_id, account_id=account_id)
+    # Proactively push approval notice and command usage guide
+    send_wechat_message(target_user_id, account_id=account_id, text=APPROVED_COMMANDS_TEXT)
 
-    return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，已向用户推送欢迎语！", target_user_id, account_id
+    return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，已向用户推送指令指南！", target_user_id, account_id
 
 def unregister_user(user_id: str) -> Tuple[bool, str]:
     """
