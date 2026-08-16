@@ -2207,7 +2207,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                         _LIVE_ADAPTERS[token_new] = self
                         accountPolling[generated_account_id] = {"running": True, "task": task}
 
-                        await self._send_reply(chat_id, f"✅ 微信登录成功！\n\n账号: {generated_account_id}\n已自动添加并开始轮询。")
+                        await self._send_reply(chat_id, f"✅ 微信登录成功！\n\n账号: {generated_account_id}\n已自动添加并开始轮询。\n\n💡 提示：所有新接入的微信用户均会自动创建专属独立 Profile；用户随时可发送【注销】或【/unregister】彻底清空自身数据。")
                         logger.info("[%s] ✅ 新账号 %s 登录成功！", self.name, generated_account_id)
                         success = True
                         break

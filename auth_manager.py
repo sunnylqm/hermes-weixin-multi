@@ -18,7 +18,12 @@ AUTH_DIR = os.path.join(HERMES_HOME, "weixin")
 APPROVED_FILE = os.path.join(AUTH_DIR, "approved_users.json")
 PENDING_FILE = os.path.join(AUTH_DIR, "pending_requests.json")
 
-DEFAULT_WELCOME_TEXT = "👋 您好！很高兴与您相遇。我是您的专属 AI 助理，请问我应该怎么称呼你呢？😊"
+DEFAULT_WELCOME_TEXT = """👋 您好！很高兴与您相遇。我是您的专属 AI 助理。
+
+📌 请问我应该怎么称呼你呢？（您可以直接回复您的称呼或姓名）
+
+💡 隐私与数据说明：
+系统已为您自动开通专属独立 Profile 与物理记忆隔离。如需注销账号并清空所有个人画像、记忆与对话数据，您可以随时发送【注销】或【/unregister】。"""
 
 # Default admin IDs that are pre-approved
 DEFAULT_APPROVED = [
@@ -168,66 +173,72 @@ def send_telegram_approval_card(
     return False
 
 def send_wechat_welcome_message(user_id: str, account_id: Optional[str] = None, text: str = DEFAULT_WELCOME_TEXT) -> bool:
-    """Proactively send a welcome message asking for the user's name/introduction."""
+    """Proactively send a welcome message with robust account discovery and fallback."""
     try:
         import requests
         accounts_dir = os.path.join(HERMES_HOME, "weixin", "accounts")
-        account_file = None
+        if not os.path.exists(accounts_dir):
+            return False
+
+        account_files = []
         if account_id and os.path.exists(os.path.join(accounts_dir, f"{account_id}.json")):
-            account_file = os.path.join(accounts_dir, f"{account_id}.json")
-        else:
-            candidates = glob.glob(os.path.join(accounts_dir, "*.json"))
-            for c in candidates:
-                if not c.endswith(".sync.json") and not c.endswith(".context-tokens.json") and not c.endswith("pending_qr.json"):
-                    account_file = c
-                    break
+            account_files.append(os.path.join(accounts_dir, f"{account_id}.json"))
 
-        if not account_file or not os.path.exists(account_file):
-            logger.warning("[Weixin Auth] Cannot send welcome message: No account file found")
-            return False
+        for c in sorted(glob.glob(os.path.join(accounts_dir, "*.json"))):
+            if not c.endswith(".sync.json") and not c.endswith(".context-tokens.json") and not c.endswith("pending_qr.json"):
+                if c not in account_files:
+                    account_files.append(c)
 
-        with open(account_file, "r", encoding="utf-8") as f:
-            acc = json.load(f)
-
-        token = acc.get("token")
-        base_url = acc.get("base_url", "https://ilinkai.weixin.qq.com").rstrip("/")
-        if not token:
-            logger.warning("[Weixin Auth] Cannot send welcome message: No token in account file")
-            return False
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "X-WECHAT-UIN": "0",
-        }
-
-        ctx_token = None
-        token_file = account_file.replace(".json", ".context-tokens.json")
-        if os.path.exists(token_file):
+        for account_file in account_files:
             try:
-                with open(token_file, "r", encoding="utf-8") as tf:
-                    tokens = json.load(tf)
-                    ctx_token = tokens.get(user_id)
-            except Exception:
-                pass
+                with open(account_file, "r", encoding="utf-8") as f:
+                    acc = json.load(f)
+                token = acc.get("token")
+                base_url = acc.get("base_url", "https://ilinkai.weixin.qq.com").rstrip("/")
+                if not token or token == "???":
+                    continue
 
-        payload = {
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": user_id,
-                "client_id": f"hermes-welcome-{uuid.uuid4().hex}",
-                "message_type": 2,
-                "message_state": 2,
-                "item_list": [{"type": 1, "text_item": {"text": text}}]
-            }
-        }
-        if ctx_token:
-            payload["msg"]["context_token"] = ctx_token
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "X-WECHAT-UIN": "0",
+                }
 
-        url = f"{base_url}/ilink/bot/sendmessage"
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        logger.info("[Weixin Auth] Sent welcome message to %s, response=%s", user_id, resp.status_code)
-        return resp.status_code == 200
+                ctx_token = None
+                token_file = account_file.replace(".json", ".context-tokens.json")
+                if os.path.exists(token_file):
+                    try:
+                        with open(token_file, "r", encoding="utf-8") as tf:
+                            tokens = json.load(tf)
+                            ctx_token = tokens.get(user_id)
+                    except Exception:
+                        pass
+
+                payload = {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": user_id,
+                        "client_id": f"hermes-welcome-{uuid.uuid4().hex}",
+                        "message_type": 2,
+                        "message_state": 2,
+                        "item_list": [{"type": 1, "text_item": {"text": text}}]
+                    }
+                }
+                if ctx_token:
+                    payload["msg"]["context_token"] = ctx_token
+
+                url = f"{base_url}/ilink/bot/sendmessage"
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                data = resp.json() if resp.status_code == 200 else {}
+                if resp.status_code == 200 and data.get("ret") in (0, None):
+                    logger.info("[Weixin Auth] Successfully sent welcome message to %s using %s", user_id, os.path.basename(account_file))
+                    return True
+                else:
+                    logger.warning("[Weixin Auth] Send welcome using %s returned %s: %s", os.path.basename(account_file), resp.status_code, resp.text)
+            except Exception as e:
+                logger.warning("[Weixin Auth] Error trying account %s: %s", account_file, e)
+
+        return False
     except Exception as e:
         logger.error("[Weixin Auth] Failed to send welcome message to %s: %s", user_id, e)
         return False
@@ -357,6 +368,7 @@ def approve_user_request(identifier: str, approver: str = "telegram_admin") -> T
     except Exception as e:
         logger.error("[Weixin Auth] Error creating profile for approved user: %s", e)
 
+    # Proactively push welcome message with greeting and unregister instructions
     send_wechat_welcome_message(target_user_id, account_id=account_id)
 
     return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，已向用户推送欢迎语！", target_user_id, account_id
