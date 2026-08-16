@@ -90,6 +90,25 @@ gateway:
         allow_all_users: true
 ```
 
+并在 `~/.hermes/.env` 中加入:
+
+```
+WEIXIN_MULTI_ALLOW_ALL_USERS=true
+```
+
+> ⚠️ **不加这一条,审批会"批准成功但用户依然被拦"**。
+>
+> 网关**刻意不信任** `dm_policy: open` —— 即使适配器声明了 `enforces_own_access_policy`
+> (历史上把 "open" 当作授权造成过 fail-open,见核心 `authz_mixin.py` 注释)。于是被插件
+> 批准过的用户仍会落进网关**自己的** pairing 流程,收到一句要"配对码"的提示 —— 那是网关的
+> 配对码,和插件的配对码是两套东西,看起来就像审批没生效。
+>
+> 本插件已把 `WEIXIN_MULTI_ALLOW_ALL_USERS` / `WEIXIN_MULTI_ALLOWED_USERS` 注册进平台注册表,
+> 所以这个开关只放开 weixin_multi 一个平台。**不要用 `GATEWAY_ALLOW_ALL_USERS=true` 代替** ——
+> 那会同时放开 Telegram、Discord 等所有平台。
+>
+> 放开的只是"网关层不再另行拦截",真正的准入仍由本插件的审批白名单决定。
+
 重启 Gateway：
 ```bash
 hermes gateway restart

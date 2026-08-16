@@ -357,6 +357,20 @@ def register(ctx):
         required_env=[],
         install_hint="pip install aiohttp cryptography",
         env_enablement_fn=_env_enablement,
+        # The gateway resolves a plugin platform's allowlist env vars from the
+        # registry. Without these it recognises neither name, so the only way
+        # to authorize a WeChat sender at the gateway layer is the global
+        # GATEWAY_ALLOW_ALL_USERS — which opens *every* platform, not just this
+        # one. Registering them keeps the opt-in scoped to weixin_multi.
+        #
+        # This matters because the gateway deliberately does not trust
+        # `dm_policy: open` from an adapter that claims
+        # enforces_own_access_policy (treating "open" as authorization was a
+        # fail-open). An approved-by-the-plugin sender therefore still falls
+        # through to the gateway's own pairing handshake and gets asked for a
+        # pairing code, despite the admin having already approved them.
+        allowed_users_env="WEIXIN_MULTI_ALLOWED_USERS",
+        allow_all_env="WEIXIN_MULTI_ALLOW_ALL_USERS",
     )
 
     # ── Register global slash commands ──
