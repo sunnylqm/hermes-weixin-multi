@@ -424,12 +424,69 @@ USER_MD_TEMPLATE = (
 )
 
 
+def _reset_memories(mem_dir: str) -> None:
+    """Write a blank per-user memory set into *mem_dir*."""
+    os.makedirs(mem_dir, exist_ok=True)
+    with open(os.path.join(mem_dir, "USER.md"), "w", encoding="utf-8") as uf:
+        uf.write(USER_MD_TEMPLATE)
+    with open(os.path.join(mem_dir, "MEMORY.md"), "w", encoding="utf-8") as mf:
+        mf.write("")
+
+
+def _is_copy_of(path: str, other: str) -> bool:
+    """True when *path* is byte-identical to a non-empty *other*.
+
+    Compares size first so the common case costs two stats. An empty source
+    cannot leak anything, so it never counts as a copy.
+    """
+    try:
+        size = os.path.getsize(other)
+        if size == 0 or os.path.getsize(path) != size:
+            return False
+    except OSError:
+        return False
+    try:
+        with open(path, "rb") as a, open(other, "rb") as b:
+            return a.read() == b.read()
+    except OSError:
+        return False
+
+
+def purge_inherited_memories(profile_name: str) -> List[str]:
+    """Blank a profile's memories if they are a copy of the default profile's.
+
+    The host materializes a missing profile by cloning the default one — which
+    copies its ``memories/`` verbatim. Because ``ensure_user_profile`` only
+    creates a profile when ``profile_exists()`` is False, a profile the host
+    materialized first is treated as already set up and its inherited memories
+    would never be blanked, leaving one user's agent primed with the instance
+    owner's USER.md and MEMORY.md. Returns the files that were reset.
+    """
+    pdir = os.path.join(_profiles_dir(), profile_name)
+    mem_dir = os.path.join(pdir, "memories")
+    default_mem = os.path.join(HERMES_HOME, "memories")
+
+    leaked = [
+        name for name in ("MEMORY.md", "USER.md")
+        if _is_copy_of(os.path.join(mem_dir, name), os.path.join(default_mem, name))
+    ]
+    if leaked:
+        logger.warning(
+            "[Weixin Auth] Profile %s inherited the default profile's %s; resetting to a blank set.",
+            profile_name, ", ".join(leaked),
+        )
+        _reset_memories(mem_dir)
+    return leaked
+
+
 def ensure_user_profile(user_id: str) -> str:
     """Return the user's profile name, creating an isolated profile if needed."""
     from hermes_cli.profiles import create_profile, profile_exists
 
     profile_name = profile_name_for(user_id)
     if profile_exists(profile_name):
+        # Existing is not the same as isolated — the host may have created it.
+        purge_inherited_memories(profile_name)
         return profile_name
 
     logger.info("[Weixin Auth] Creating isolated profile for user=%s -> %s", user_id, profile_name)
@@ -453,12 +510,8 @@ def ensure_user_profile(user_id: str) -> str:
     # Same reason, for credentials inherited through the cloned .env.
     scrub_platform_credentials(os.path.join(pdir, ".env"))
 
-    mem_dir = os.path.join(pdir, "memories")
-    os.makedirs(mem_dir, exist_ok=True)
-    with open(os.path.join(mem_dir, "USER.md"), "w", encoding="utf-8") as uf:
-        uf.write(USER_MD_TEMPLATE)
-    with open(os.path.join(mem_dir, "MEMORY.md"), "w", encoding="utf-8") as mf:
-        mf.write("")
+    # The clone also copied the default profile's memories — replace them.
+    _reset_memories(os.path.join(pdir, "memories"))
     return profile_name
 
 
