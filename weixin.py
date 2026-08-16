@@ -1860,8 +1860,10 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                 user_id=sender_id,
                 user_name=sender_id,
             )
-            if not source.profile and sender_id and chat_type == "dm":
-                source.profile = self._get_or_create_user_profile(sender_id)
+            if sender_id and chat_type == "dm":
+                auto_profile = self._get_or_create_user_profile(sender_id)
+                if not source.profile or source.profile in ("weixin", "default"):
+                    source.profile = auto_profile
             event = MessageEvent(
                 text=text,
                 message_type=_message_type_from_media(media_types, text),
