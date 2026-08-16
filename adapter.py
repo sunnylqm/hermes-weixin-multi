@@ -126,15 +126,37 @@ def _accounts_dir() -> str:
     hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
     return os.path.join(hermes_home, "weixin", "accounts")
 
+
+# Sidecar files that live in the accounts directory but are not accounts.
+_ACCOUNT_SIDECAR_SUFFIXES = (".sync.json", ".context-tokens.json")
+# Long-poll considered live if its sync buffer advanced within this window.
+_ACCOUNT_LIVE_WINDOW_SECONDS = 300
+
+
+def _is_account_file(filename: str) -> bool:
+    """True for a real account file.
+
+    Deliberately not matched by an ``wechat-`` name prefix: accounts added by
+    the QR flow are named after their ``ilink_bot_id`` (e.g.
+    ``b9e607bd8f41@im.bot.json``), so a prefix test hides them from the admin
+    listing entirely.
+    """
+    if not filename.endswith(".json"):
+        return False
+    if filename.endswith(_ACCOUNT_SIDECAR_SUFFIXES):
+        return False
+    return filename not in ("pending_qr.json", "account_counter.json")
+
+
 def _generate_account_id() -> str:
     """Generate next available wechat-N account ID."""
     accounts_dir = _accounts_dir()
     existing = set()
     if os.path.isdir(accounts_dir):
         for f in os.listdir(accounts_dir):
-            if f.endswith(".json"):
-                existing.add(f.replace(".json", ""))
-    
+            if _is_account_file(f):
+                existing.add(f[: -len(".json")])
+
     n = 1
     while f"wechat-{n}" in existing:
         n += 1
@@ -160,26 +182,55 @@ def _save_account(account_id: str, token: str, base_url: str = "") -> str:
     return path
 
 def _list_accounts() -> list:
-    """List all accounts from disk."""
+    """List all accounts from disk, with whether each is actually polling.
+
+    A configured token says nothing about liveness — an expired iLink session
+    leaves the account configured but silently not receiving anything. The
+    sync-buffer file is rewritten on every successful long poll, so its mtime
+    is the honest liveness signal.
+    """
     accounts_dir = _accounts_dir()
     accounts = []
-    if os.path.isdir(accounts_dir):
-        for f in sorted(os.listdir(accounts_dir)):
-            # Only match actual account files: wechat-N.json
-            if f.endswith(".json") and f.startswith("wechat-") and not "." in f[:-5]:
-                account_id = f.replace(".json", "")
-                path = os.path.join(accounts_dir, f)
-                try:
-                    with open(path) as fh:
-                        data = json.load(fh)
-                    accounts.append({
-                        "id": account_id,
-                        "token": data.get("token", ""),
-                        "base_url": data.get("base_url", ""),
-                    })
-                except Exception:
-                    accounts.append({"id": account_id, "token": "???", "base_url": ""})
+    if not os.path.isdir(accounts_dir):
+        return accounts
+
+    now = time.time()
+    for f in sorted(os.listdir(accounts_dir)):
+        if not _is_account_file(f):
+            continue
+        account_id = f[: -len(".json")]
+        path = os.path.join(accounts_dir, f)
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            entry = {
+                "id": account_id,
+                "token": data.get("token", ""),
+                "base_url": data.get("base_url", ""),
+            }
+        except Exception:
+            entry = {"id": account_id, "token": "???", "base_url": ""}
+
+        sync_path = os.path.join(accounts_dir, f"{account_id}.sync.json")
+        try:
+            age = now - os.path.getmtime(sync_path)
+            entry["live"] = age < _ACCOUNT_LIVE_WINDOW_SECONDS
+            entry["last_poll_age"] = int(age)
+        except OSError:
+            entry["live"] = False
+            entry["last_poll_age"] = None
+        accounts.append(entry)
     return accounts
+
+
+def _format_poll_age(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "从未"
+    if seconds < 120:
+        return f"{seconds} 秒前"
+    if seconds < 7200:
+        return f"{seconds // 60} 分钟前"
+    return f"{seconds // 3600} 小时前"
 
 # ── Pending QR management ──
 # When /wechat-login is called from WebUI, the QR data is saved to disk.
@@ -393,9 +444,21 @@ def register(ctx):
         else:
             lines = ["📱 Weixin Multi 账号列表：\n"]
             for acc in accounts:
-                has_token = "✅" if acc.get("token") and acc["token"] != "???" else "❌"
-                lines.append(f"  {has_token} {acc['id']} — token={'已配置' if has_token == '✅' else '未配置'}")
-            lines.append(f"\n共 {len(accounts)} 个账号")
+                has_token = bool(acc.get("token")) and acc["token"] != "???"
+                if not has_token:
+                    lines.append(f"  ❌ {acc['id']} — 缺少 token")
+                elif acc.get("live"):
+                    lines.append(f"  ✅ {acc['id']} — 在线（{_format_poll_age(acc.get('last_poll_age'))}轮询）")
+                elif acc.get("last_poll_age") is None:
+                    lines.append(f"  ⚠️ {acc['id']} — 已掉线（从未成功轮询）")
+                else:
+                    lines.append(
+                        f"  ⚠️ {acc['id']} — 已掉线（最后轮询 {_format_poll_age(acc['last_poll_age'])}）"
+                    )
+            dead = sum(1 for a in accounts if not a.get("live"))
+            lines.append(f"\n共 {len(accounts)} 个账号，{len(accounts) - dead} 个在线")
+            if dead:
+                lines.append("⚠️ 掉线账号通常是 iLink 会话过期，需重新 /wechat-login 扫码恢复。")
             lines.append("在 Telegram 发送 /wechat-login 添加新账号")
             body = "\n".join(lines)
 
