@@ -976,6 +976,8 @@ def reject_user_request(identifier: str, allow_user_id: bool = True) -> Tuple[bo
 # likewise admin-controlled.
 
 _MODEL_TOP_LEVEL_KEYS = ("model", "fallback_providers", "custom_providers")
+# Per-auxiliary-task keys that travel together.
+_AUX_SYNCED_KEYS = ("model", "provider")
 
 
 def _profiles_dir() -> str:
@@ -1035,7 +1037,17 @@ def _extract_model_config(cfg: dict) -> dict:
     out = {k: cfg[k] for k in _MODEL_TOP_LEVEL_KEYS if k in cfg}
     aux = cfg.get("auxiliary")
     if isinstance(aux, dict):
-        sub = {n: s["model"] for n, s in aux.items() if isinstance(s, dict) and "model" in s}
+        sub = {}
+        for name, task in aux.items():
+            if not isinstance(task, dict):
+                continue
+            # provider travels with model: an auxiliary backend pinned to a
+            # different provider than the main model (e.g. routing vision to
+            # openai-codex while the main model is a text-only custom model)
+            # is meaningless if only the model id propagates.
+            keep = {k: task[k] for k in _AUX_SYNCED_KEYS if k in task}
+            if keep:
+                sub[name] = keep
         if sub:
             out["auxiliary"] = sub
     for parent, key in (("delegation", "model"), ("agent", "reasoning_effort")):
@@ -1059,13 +1071,14 @@ def _apply_model_config(cfg: dict, model_cfg: dict) -> List[str]:
         node = cfg.get("auxiliary")
         if not isinstance(node, dict):
             node = cfg["auxiliary"] = {}
-        for name, value in model_cfg["auxiliary"].items():
+        for name, values in model_cfg["auxiliary"].items():
             entry = node.get(name)
             if not isinstance(entry, dict):
                 entry = node[name] = {}
-            if entry.get("model") != value:
-                entry["model"] = value
-                changed.append(f"auxiliary.{name}.model")
+            for key, value in values.items():
+                if entry.get(key) != value:
+                    entry[key] = value
+                    changed.append(f"auxiliary.{name}.{key}")
 
     for parent in ("delegation", "agent"):
         if parent not in model_cfg:
