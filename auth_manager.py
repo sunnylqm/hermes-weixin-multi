@@ -365,7 +365,16 @@ _PLATFORM_CREDENTIAL_RE = re.compile(
     r"|WECHAT|MESSENGER|INSTAGRAM|IMESSAGE|RELAY)_[A-Z0-9_]*"
     r"(TOKEN|SECRET|PASSWORD|CREDENTIAL)$"
 )
-_EXTRA_SCRUBBED_ENV_KEYS = frozenset({"HERMES_GATEWAY_TOKEN"})
+_EXTRA_SCRUBBED_ENV_KEYS = frozenset({
+    "HERMES_GATEWAY_TOKEN",
+    # Not a credential, but an *enablement* key: the host enables the built-in
+    # weixin platform when either WEIXIN_TOKEN or WEIXIN_ACCOUNT_ID is set
+    # (gateway/config.py: `if weixin_token or weixin_account_id`). Leaving it
+    # behind makes a per-user profile try to start an adapter it has no token
+    # for, logging "WEIXIN_TOKEN is required" on every restart. Secondary
+    # profiles never own platform connections in multiplex mode.
+    "WEIXIN_ACCOUNT_ID",
+})
 
 
 def _is_platform_credential(key: str) -> bool:
