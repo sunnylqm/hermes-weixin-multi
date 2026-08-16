@@ -103,6 +103,19 @@ def _admin_chat_ids() -> set:
     return ids
 
 
+def _admin_user_ids() -> set:
+    """Telegram *user* IDs allowed to act as admin.
+
+    Distinct from _admin_chat_ids(): TELEGRAM_HOME_CHANNEL is a chat to send
+    to (and may be a negative group ID), which is not comparable to the user
+    ID behind a button click. Prefer TELEGRAM_ALLOWED_USERS, and only fall
+    back to the channel when that is all that is configured.
+    """
+    allowed = _read_telegram_env("TELEGRAM_ALLOWED_USERS")
+    ids = {p.strip() for p in (allowed or "").split(",") if p.strip()}
+    return ids or _admin_chat_ids()
+
+
 def telegram_configured() -> bool:
     token, chat_id = _get_telegram_config()
     return bool(token and chat_id)
@@ -200,26 +213,41 @@ def throttle(key: str, min_interval_secs: float) -> bool:
     return True
 
 
+_TELEGRAM_ENV_FILES = (
+    os.path.join(HERMES_HOME, "profiles", "telegram", ".env"),
+    os.path.join(HERMES_HOME, ".env"),
+)
+
+
+def _read_telegram_env(key: str) -> Optional[str]:
+    """Read *key* from the environment, falling back to the Hermes .env files."""
+    value = os.getenv(key)
+    if value:
+        return value.strip()
+    prefix = f"{key}="
+    for path in _TELEGRAM_ENV_FILES:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(prefix):
+                        found = line[len(prefix):].strip()
+                        if found:
+                            return found
+        except OSError:
+            continue
+    return None
+
+
 def _get_telegram_config() -> Tuple[Optional[str], Optional[str]]:
     """Retrieve Telegram Bot Token and Admin Chat ID from env files."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_ALLOWED_USERS")
-    
-    if not token or not chat_id:
-        for p in [
-            os.path.join(HERMES_HOME, "profiles", "telegram", ".env"),
-            os.path.join(HERMES_HOME, ".env"),
-        ]:
-            if os.path.exists(p):
-                with open(p) as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("TELEGRAM_BOT_TOKEN=") and not token:
-                            token = line.split("=", 1)[1].strip()
-                        if line.startswith("TELEGRAM_HOME_CHANNEL=") and not chat_id:
-                            chat_id = line.split("=", 1)[1].strip()
-                        if line.startswith("TELEGRAM_ALLOWED_USERS=") and not chat_id:
-                            chat_id = line.split("=", 1)[1].strip()
+    token = _read_telegram_env("TELEGRAM_BOT_TOKEN")
+    chat_id = (
+        _read_telegram_env("TELEGRAM_HOME_CHANNEL")
+        or _read_telegram_env("TELEGRAM_ALLOWED_USERS")
+    )
     return token, chat_id
 
 def _load_json(file_path: str, default: dict) -> dict:
@@ -871,6 +899,67 @@ def reject_user_request(identifier: str, allow_user_id: bool = True) -> Tuple[bo
     if removed:
         return True, f"已成功拒绝/移除用户或申请: {identifier}"
     return False, f"未找到相关用户或申请: {identifier}"
+
+CALLBACK_PREFIX = "wx:"
+
+
+def is_telegram_admin(clicker_id: Optional[str]) -> bool:
+    """True when *clicker_id* is a configured Telegram admin user.
+
+    Fails closed: an unknown clicker, or no configured admin list at all, is
+    not an admin.
+    """
+    if clicker_id is None or str(clicker_id).strip() == "":
+        return False
+    admins = _admin_user_ids()
+    if not admins:
+        return False
+    return str(clicker_id).strip() in admins
+
+
+def handle_telegram_callback(data: str, clicker_id: Optional[str] = None) -> Dict[str, Any]:
+    """Handle a ``wx:appr:<code>`` / ``wx:deny:<code>`` inline-button click.
+
+    All authorization and state changes live here rather than in the host's
+    Telegram adapter, so the host only needs a thin dispatch that survives
+    upgrades. Returns a render instruction:
+
+        {"success": bool, "answer": <toast text>, "note": <HTML to append|None>}
+    """
+    if not is_telegram_admin(clicker_id):
+        logger.warning(
+            "[Weixin Auth] Refused approval button click from non-admin telegram user=%s",
+            clicker_id,
+        )
+        return {"success": False, "answer": "⛔ 你无权处理微信接入申请。", "note": None}
+
+    parts = (data or "").split(":", 2)
+    if len(parts) != 3 or f"{parts[0]}:" != CALLBACK_PREFIX:
+        return {"success": False, "answer": "无效的回调数据。", "note": None}
+
+    action, code = parts[1], parts[2]
+    if action == "appr":
+        success, msg, _user, _acc = approve_user_request(code, approver=f"telegram:{clicker_id}")
+        return {
+            "success": success,
+            "answer": "✅ 已批准该微信用户！" if success else f"❌ {msg[:180]}",
+            "note": (
+                "\n\n🟢 <b>【已批准】</b> 已自动为其开通独立专属 Profile！"
+                if success else None
+            ),
+        }
+    if action == "deny":
+        success, msg = reject_user_request(code)
+        return {
+            "success": success,
+            "answer": "❌ 已拒绝该申请！" if success else f"❌ {msg[:180]}",
+            "note": (
+                "\n\n🔴 <b>【已拒绝】</b> 该用户的接入申请已被拒绝。"
+                if success else None
+            ),
+        }
+    return {"success": False, "answer": f"未知操作: {action}", "note": None}
+
 
 def list_auth_status() -> dict:
     """Return lists of approved users and pending requests."""
