@@ -526,8 +526,43 @@ def send_telegram_approval_card(
         logger.error("[Weixin Auth] Error sending Telegram approval card: %s", e)
     return False
 
+def _ilink_headers(token: str, body_len: int) -> Dict[str, str]:
+    """Headers for a direct iLink call.
+
+    ``AuthorizationType`` is not optional: without it the API answers
+    ``errcode:-14 session timeout`` and the message is never delivered, no
+    matter how well-formed the rest of the request is. Keep this in sync with
+    ``_headers()`` in weixin.py — that module is loaded under a synthetic
+    module name, so it cannot simply be imported here.
+    """
+    return {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "Content-Length": str(body_len),
+        "X-WECHAT-UIN": "0",
+        "iLink-App-Id": "bot",
+        "iLink-App-ClientVersion": str((2 << 16) | (2 << 8) | 0),
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def _ilink_call_ok(data: Dict[str, Any]) -> bool:
+    """True only when iLink reported no error.
+
+    Errors come back as HTTP 200 with either ``ret`` or ``errcode`` set, so
+    both must be checked — testing ``ret`` alone reads ``errcode:-14`` as
+    success (``data.get("ret")`` is None, and None was treated as OK).
+    """
+    return data.get("ret") in (0, None) and data.get("errcode") in (0, None)
+
+
 def send_wechat_message(user_id: str, account_id: Optional[str] = None, text: str = APPROVED_COMMANDS_TEXT) -> bool:
-    """Proactively send a message to a WeChat user with robust account discovery."""
+    """Proactively send a message to a WeChat user.
+
+    When *account_id* is known we use only that account — the user has no
+    relationship with the other bots, so falling back to them cannot work and
+    would at best deliver from a stranger.
+    """
     try:
         import requests
         accounts_dir = os.path.join(HERMES_HOME, "weixin", "accounts")
@@ -537,10 +572,9 @@ def send_wechat_message(user_id: str, account_id: Optional[str] = None, text: st
         account_files = []
         if account_id and os.path.exists(os.path.join(accounts_dir, f"{account_id}.json")):
             account_files.append(os.path.join(accounts_dir, f"{account_id}.json"))
-
-        for c in sorted(glob.glob(os.path.join(accounts_dir, "*.json"))):
-            if not c.endswith(".sync.json") and not c.endswith(".context-tokens.json") and not c.endswith("pending_qr.json"):
-                if c not in account_files:
+        else:
+            for c in sorted(glob.glob(os.path.join(accounts_dir, "*.json"))):
+                if not c.endswith((".sync.json", ".context-tokens.json", "pending_qr.json")):
                     account_files.append(c)
 
         for account_file in account_files:
@@ -551,12 +585,6 @@ def send_wechat_message(user_id: str, account_id: Optional[str] = None, text: st
                 base_url = acc.get("base_url", "https://ilinkai.weixin.qq.com").rstrip("/")
                 if not token or token == "???":
                     continue
-
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                    "X-WECHAT-UIN": "0",
-                }
 
                 ctx_token = None
                 token_file = account_file.replace(".json", ".context-tokens.json")
@@ -582,9 +610,12 @@ def send_wechat_message(user_id: str, account_id: Optional[str] = None, text: st
                     payload["msg"]["context_token"] = ctx_token
 
                 url = f"{base_url}/ilink/bot/sendmessage"
-                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                resp = requests.post(
+                    url, data=body, headers=_ilink_headers(token, len(body)), timeout=10
+                )
                 data = resp.json() if resp.status_code == 200 else {}
-                if resp.status_code == 200 and data.get("ret") in (0, None):
+                if resp.status_code == 200 and _ilink_call_ok(data):
                     logger.info("[Weixin Auth] Successfully sent message to %s using %s", user_id, os.path.basename(account_file))
                     return True
                 else:
@@ -716,10 +747,16 @@ def approve_user_request(
         logger.error("[Weixin Auth] Error creating profile for approved user: %s", e)
         profile_name = profile_name_for(target_user_id)
 
-    # Proactively push approval notice and command usage guide
-    send_wechat_message(target_user_id, account_id=account_id, text=APPROVED_COMMANDS_TEXT)
+    # Proactively push approval notice and command usage guide. Report whether
+    # it actually landed — this used to be fire-and-forget, which let a broken
+    # push go unnoticed indefinitely.
+    pushed = send_wechat_message(target_user_id, account_id=account_id, text=APPROVED_COMMANDS_TEXT)
+    push_note = (
+        "已向用户推送指令指南！" if pushed
+        else "⚠️ 但向用户推送指令指南失败，请检查日志（用户仍可正常对话）。"
+    )
 
-    return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，已向用户推送指令指南！", target_user_id, account_id
+    return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，{push_note}", target_user_id, account_id
 
 # ── Two-step Unregister Workflow ──
 
