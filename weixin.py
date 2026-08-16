@@ -1825,15 +1825,32 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             # Record chat→account mapping for replies
             self._chat_to_account[effective_chat_id] = account_id
 
-            # ---- Unregister / Delete Account Check for WeChat DMs ----
+            # ---- Two-step Unregister / Delete Account Check for WeChat DMs ----
             if chat_type == "dm" and sender_id and text:
                 clean_cmd = text.strip().lower()
+                try:
+                    import auth_manager
+                except ImportError:
+                    from . import auth_manager
+
+                # 1. Check if user is currently confirming or cancelling a pending unregister request
+                if auth_manager.has_pending_unregister(sender_id):
+                    if clean_cmd in ["确认注销", "确认", "confirm", "/confirm-unregister", "yes", "确定注销", "确定"]:
+                        success, reply_msg = auth_manager.confirm_unregister(sender_id)
+                        asyncio.create_task(self.send(effective_chat_id, reply_msg))
+                        return
+                    elif clean_cmd in ["取消", "取消注销", "cancel", "no", "算了", "不用了", "返回"]:
+                        auth_manager.cancel_unregister(sender_id)
+                        reply_msg = "已为您取消注销操作，您的数据与专属记忆已安全保留。您可以继续正常与我对话。😊"
+                        asyncio.create_task(self.send(effective_chat_id, reply_msg))
+                        return
+                    else:
+                        # User sent another message: auto-cancel unregister and continue with standard message flow
+                        auth_manager.cancel_unregister(sender_id)
+
+                # 2. Check if user is initiating an unregister request
                 if clean_cmd in ["/unregister", "/delete-account", "/reset-memory", "注销", "注销账号", "注销账户", "清除我的数据", "清空我的数据", "彻底注销"]:
-                    try:
-                        import auth_manager
-                    except ImportError:
-                        from . import auth_manager
-                    success, reply_msg = auth_manager.unregister_user(sender_id)
+                    reply_msg = auth_manager.request_unregister(sender_id)
                     asyncio.create_task(self.send(effective_chat_id, reply_msg))
                     return
             # ---- End Unregister Check ----

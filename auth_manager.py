@@ -18,6 +18,10 @@ AUTH_DIR = os.path.join(HERMES_HOME, "weixin")
 APPROVED_FILE = os.path.join(AUTH_DIR, "approved_users.json")
 PENDING_FILE = os.path.join(AUTH_DIR, "pending_requests.json")
 
+# In-memory store for pending two-step unregister confirmations (user_id -> timestamp)
+UNREGISTER_PENDING: Dict[str, float] = {}
+UNREGISTER_TIMEOUT_SECS = 120  # 2 minutes confirmation window
+
 WELCOME_ON_SCAN_TEXT = """👋 您好！很高兴与您相遇。我是您的专属 AI 助理。
 
 📌 请问我应该怎么称呼你呢？（您可以直接回复您的称呼或姓名）
@@ -36,6 +40,13 @@ APPROVED_COMMANDS_TEXT = """🎉 您的接入申请已获批准，专属独立�
 • /unregister 或发送【注销】 — 随时彻底清空所有记忆并注销账号
 
 现在您可以直接向我发送任何消息，开始对话了！😊"""
+
+UNREGISTER_CONFIRM_PROMPT = """⚠️ 【注销二次确认】请确认是否彻底注销账号？
+
+注销后，您的专属独立空间、所有对话历史记录、个人偏好画像与长期记忆将【被永久彻底删除且无法恢复】。
+
+🔴 如确认注销，请在 2 分钟内回复：【确认注销】
+🟢 如需取消注销，请回复【取消】或直接继续发送其他正常对话内容。"""
 
 # Default admin IDs that are pre-approved
 DEFAULT_APPROVED = [
@@ -388,6 +399,39 @@ def approve_user_request(identifier: str, approver: str = "telegram_admin") -> T
 
     return True, f"已成功批准微信用户 {target_user_id}，并已创建专属独立 Profile [{profile_name}]，已向用户推送指令指南！", target_user_id, account_id
 
+# ── Two-step Unregister Workflow ──
+
+def request_unregister(user_id: str) -> str:
+    """Initiate unregister request, asking user for secondary confirmation."""
+    UNREGISTER_PENDING[user_id] = time.time()
+    logger.info("[Weixin Auth] User %s requested unregister, waiting for confirmation", user_id)
+    return UNREGISTER_CONFIRM_PROMPT
+
+def has_pending_unregister(user_id: str) -> bool:
+    """Check if user has an active pending unregister confirmation."""
+    t = UNREGISTER_PENDING.get(user_id)
+    if not t:
+        return False
+    if time.time() - t > UNREGISTER_TIMEOUT_SECS:
+        UNREGISTER_PENDING.pop(user_id, None)
+        return False
+    return True
+
+def cancel_unregister(user_id: str) -> bool:
+    """Cancel unregister request."""
+    if user_id in UNREGISTER_PENDING:
+        UNREGISTER_PENDING.pop(user_id, None)
+        logger.info("[Weixin Auth] User %s cancelled unregister", user_id)
+        return True
+    return False
+
+def confirm_unregister(user_id: str) -> Tuple[bool, str]:
+    """Execute complete unregister after two-step confirmation."""
+    if not has_pending_unregister(user_id):
+        return False, "⚠️ 注销请求已超时或未发起。如需注销，请重新发送【注销】指令。"
+    UNREGISTER_PENDING.pop(user_id, None)
+    return unregister_user(user_id)
+
 def unregister_user(user_id: str) -> Tuple[bool, str]:
     """
     Completely unregister a user:
@@ -421,7 +465,7 @@ def unregister_user(user_id: str) -> Tuple[bool, str]:
         logger.error("[Weixin Auth] Failed to delete profile dir %s: %s", profile_name, e)
 
     admin_msg = (
-        f"🗑️ <b>微信用户已主动注销</b>\n"
+        f"🗑️ <b>微信用户已完成二次确认并注销</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>用户 ID:</b> <code>{html.escape(user_id)}</code>\n"
         f"⏰ <b>注销时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
