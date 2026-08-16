@@ -540,7 +540,11 @@ def register(ctx):
         if not arg:
             current = am.current_model()
             lines = [f"🧠 主模型：{current or '(未配置)'}"]
-            lines.append(f"🔁 备用模型：{am.current_fallback_model() or '(未配置)'}\n")
+            lines.append(f"🔁 备用模型：{am.current_fallback_model() or '(未配置)'}")
+            managed = am.managed_config_path()
+            if managed and os.path.isfile(managed):
+                lines.append(f"📌 由 managed 层强制：{managed}（覆盖以下各 profile 的自有配置）")
+            lines.append("")
             for name, path in am.all_profile_configs():
                 try:
                     cfg = am._load_yaml(path)
@@ -572,6 +576,8 @@ def register(ctx):
         lines = [f"🧠 主模型 → {result['model']}"]
         if fallback:
             lines.append(f"🔁 备用模型 → {result['fallback']}")
+        if result.get("managed"):
+            lines.append("\n📌 已写入 managed 层，对所有 profile 强制生效（覆盖各自的 config.yaml）。")
         if result["updated"]:
             lines.append(f"\n已更新 {len(result['updated'])} 个 profile：")
             for name, changed in result["updated"]:

@@ -1094,8 +1094,45 @@ def _apply_model_config(cfg: dict, model_cfg: dict) -> List[str]:
     return changed
 
 
+_DEFAULT_MANAGED_DIR = "/etc/hermes"
+
+
+def managed_config_path(*, require_writable: bool = False) -> Optional[str]:
+    """Path to the managed-scope config, or None when no managed scope is active.
+
+    Mirrors ``hermes_cli.managed_scope.get_managed_dir()``: ``$HERMES_MANAGED_DIR``
+    wins when it points at an existing directory, otherwise ``/etc/hermes`` when
+    it exists.
+
+    The managed layer merges *after* a profile's own config.yaml, so whatever it
+    pins wins over every profile — including a value a user wrote themselves with
+    ``/model --global``. That makes it the right home for instance-wide model
+    choice: one file, no propagation, no drift, and not overridable per user.
+    """
+    d = (os.environ.get("HERMES_MANAGED_DIR", "") or "").strip() or _DEFAULT_MANAGED_DIR
+    if not os.path.isdir(d):
+        return None
+    if require_writable and not os.access(d, os.W_OK):
+        return None
+    return os.path.join(d, "config.yaml")
+
+
+def _read_managed_config() -> dict:
+    path = managed_config_path()
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        return _load_yaml(path)
+    except Exception as e:
+        logger.warning("[Weixin Auth] Could not read managed config: %s", e)
+        return {}
+
+
 def current_model() -> Optional[str]:
-    """The model the default profile is configured with."""
+    """The effective model: what the managed layer pins, else the default profile."""
+    managed = _read_managed_config().get("model") or {}
+    if isinstance(managed, dict) and managed.get("default"):
+        return managed["default"]
     try:
         cfg = _load_yaml(os.path.join(HERMES_HOME, "config.yaml"))
     except Exception as e:
@@ -1105,16 +1142,79 @@ def current_model() -> Optional[str]:
     return model.get("default") if isinstance(model, dict) else None
 
 
-def current_fallback_model() -> Optional[str]:
-    """The model of the first entry in the default profile's fallback chain."""
-    try:
-        cfg = _load_yaml(os.path.join(HERMES_HOME, "config.yaml"))
-    except Exception:
-        return None
+def _first_fallback_model(cfg: dict) -> Optional[str]:
     chain = cfg.get("fallback_providers")
     if isinstance(chain, list) and chain and isinstance(chain[0], dict):
         return chain[0].get("model")
     return None
+
+
+def current_fallback_model() -> Optional[str]:
+    """The effective fallback model: managed layer first, else the default profile."""
+    managed = _first_fallback_model(_read_managed_config())
+    if managed:
+        return managed
+    try:
+        return _first_fallback_model(_load_yaml(os.path.join(HERMES_HOME, "config.yaml")))
+    except Exception:
+        return None
+
+
+def _set_model_managed(
+    path: str,
+    model_id: Optional[str],
+    fallback_model: Optional[str],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Pin the model in the managed-scope config."""
+    result["managed"] = True
+    try:
+        cfg = _load_yaml(path) if os.path.isfile(path) else {}
+    except Exception as e:
+        result["errors"].append(f"读取 managed 配置失败: {e}")
+        return result
+
+    changed: List[str] = []
+    if model_id:
+        node = cfg.get("model")
+        if not isinstance(node, dict):
+            node = cfg["model"] = {}
+        if node.get("default") != model_id:
+            node["default"] = model_id
+            changed.append("model.default")
+
+    if fallback_model:
+        chain = cfg.get("fallback_providers")
+        if isinstance(chain, list) and chain and isinstance(chain[0], dict):
+            if chain[0].get("model") != fallback_model:
+                chain[0]["model"] = fallback_model
+                changed.append("fallback_providers[0].model")
+        else:
+            result["errors"].append(
+                "managed 配置里没有 fallback_providers 链，未设置备用模型"
+                "（provider/base_url 等连接信息需先在该文件里配好）"
+            )
+
+    if changed:
+        try:
+            if os.path.isfile(path):
+                backup_dir = os.path.join(AUTH_DIR, f"model-sync-{time.strftime('%Y%m%d-%H%M%S')}")
+                os.makedirs(backup_dir, exist_ok=True)
+                os.chmod(backup_dir, 0o700)
+                shutil.copy2(path, os.path.join(backup_dir, "managed.config.yaml"))
+                result["backup"] = backup_dir
+            _dump_yaml(path, cfg)
+            result["updated"].append((f"managed:{path}", changed))
+        except Exception as e:
+            result["errors"].append(f"写入 managed 配置失败: {e}")
+            return result
+    else:
+        result["unchanged"].append(f"managed:{path}")
+
+    result["model"] = (cfg.get("model") or {}).get("default")
+    result["fallback"] = _first_fallback_model(cfg)
+    logger.info("[Weixin Auth] Managed model pin -> %s (fallback %s)", result["model"], result["fallback"])
+    return result
 
 
 def set_model_everywhere(
@@ -1133,11 +1233,19 @@ def set_model_everywhere(
 
     Pass ``wx_only=True`` to limit propagation to the wx_* profiles.
     """
-    default_cfg_path = os.path.join(HERMES_HOME, "config.yaml")
     result: Dict[str, Any] = {
-        "model": None, "fallback": None,
+        "model": None, "fallback": None, "managed": False,
         "updated": [], "unchanged": [], "errors": [], "backup": None,
     }
+
+    # When a managed scope exists it is the single authoritative place: it
+    # merges after every profile's own config, so pinning here applies
+    # instance-wide with no propagation and cannot be overridden per profile.
+    managed_path = managed_config_path(require_writable=True)
+    if managed_path and (model_id or fallback_model):
+        return _set_model_managed(managed_path, model_id, fallback_model, result)
+
+    default_cfg_path = os.path.join(HERMES_HOME, "config.yaml")
 
     try:
         default_cfg = _load_yaml(default_cfg_path)
