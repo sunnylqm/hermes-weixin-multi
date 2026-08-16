@@ -137,7 +137,30 @@ hermes gateway restart
 一个 profile，就意味着一份独立的模型配置副本。而内置 `/model` 是「会话级；`--global`
 持久化」，用户可以自行改掉自己那份。
 
-`/wechat-model` 把 default profile 的模型配置写入所有 `wx_*` profile，同步范围：
+### 推荐：用 managed scope 而不是逐 profile 下发
+
+Hermes 的配置合并是三层，**没有"读取 default profile"这一层**：
+
+```
+DEFAULT_CONFIG  →  该 profile 自己的 config.yaml  →  managed scope
+```
+
+所以 profile 里**不能**把 `model` 置空来继承全局 —— `DEFAULT_CONFIG["model"]` 是空字符串，
+省略只会得到"没有模型"。
+
+但 managed scope(`$HERMES_MANAGED_DIR`，否则 `/etc/hermes/config.yaml`)合并在**最后**，
+它 pin 的值**覆盖每一个 profile**。把模型放这里有两个好处：
+
+- 一个文件对所有 profile 生效，无需下发、不会漂移，新建 profile 自动继承
+- 它同样覆盖用户用 `/model --global` 写进自己 profile 的值 —— "只有管理员能改模型"
+  从**拦命令**升级为**配置解析层面的性质**
+
+检测到可写的 managed scope 时，`/wechat-model` 会直接写它；否则回落到逐 profile 下发。
+
+> 权限取舍：`/etc/hermes` 归 root 时最安全，但网关（非 root）就改不了，`/wechat-model` 会失效。
+> 若希望管理员仍能在 Telegram 改模型，把该目录属主给运行网关的用户即可。
+
+逐 profile 下发（无 managed scope 时）的同步范围：
 
 | 同步 | 不同步 |
 |---|---|
