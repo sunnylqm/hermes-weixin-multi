@@ -169,6 +169,60 @@ Profile 目录名取微信用户 ID 的 SHA-256 前 16 位。早期版本使用�
 | `WEIXIN_ADMIN_CHANNEL` | `telegram` | 管理渠道。设为 `any` 可关闭该限制（**不推荐**，会恢复任意渠道可执行管理命令的旧行为） |
 | `WEIXIN_DEFAULT_APPROVED` | 空 | 逗号分隔的预批准微信用户 ID。**默认为空**；此处配置的 ID 会在每次启动时重新写回白名单，因而无法通过 `/reject_wechat` 撤销 |
 
+### Telegram 审批按钮（需要宿主侧一段转发代码）
+
+审批卡片上的 **[✅ 批准加入] / [❌ 拒绝]** 按钮依赖 Telegram 的 `callback_query`。
+Hermes 的插件 API 目前没有暴露 Telegram 回调注册点（只有 `register_slack_action_handler`），
+因此需要在宿主的 Telegram 适配器 `_handle_callback_query()` 里加一段**转发**代码。
+
+鉴权与所有状态变更都在本插件的 `auth_manager.handle_telegram_callback()` 内完成，
+宿主侧只负责转发，因此这段代码在 Hermes 升级被覆盖后重新贴一次即可，无需重新实现安全逻辑：
+
+```python
+# --- WeChat Multi-account user approval callbacks (wx:appr / wx:deny) ---
+# Thin dispatch only: authorization and every state change live in the
+# weixin-multi plugin's auth_manager, so they survive host upgrades.
+if data.startswith("wx:"):
+    try:
+        import os as _os
+        import sys as _sys
+
+        _wx_dir = _os.path.join(
+            _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")),
+            "plugins",
+            "weixin-multi",
+        )
+        if _wx_dir not in _sys.path:
+            _sys.path.insert(0, _wx_dir)
+        import auth_manager
+
+        result = auth_manager.handle_telegram_callback(
+            data, clicker_id=str(getattr(query.from_user, "id", ""))
+        )
+        await query.answer(text=result.get("answer") or "")
+        note = result.get("note")
+        if note:
+            try:
+                await query.edit_message_text(
+                    text=(query.message.text or "") + note,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.error("Failed to handle weixin approval callback: %s", exc)
+        await query.answer(text=f"操作异常: {exc}")
+    return
+```
+
+> ⚠️ **不要**在宿主侧直接调用 `approve_user_request()` / `reject_user_request()`。
+> 那样会跳过点击者身份校验 —— 卡片若出现在群里，任何成员都能点“批准”。
+> `handle_telegram_callback()` 会先用 `TELEGRAM_ALLOWED_USERS` 校验点击者，
+> 未配置管理员时一律拒绝（fail closed）。
+
+不贴这段也不影响使用：管理员照常可以在 Telegram 输入 `/approve_wechat <配对码>`。
+
 ---
 
 ## ⚙️ 配置与存储路径 / Configuration
