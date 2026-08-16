@@ -204,6 +204,10 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
+# Content-fingerprint dedup only guards against near-instant redelivery, so it
+# stays far shorter than the message_id TTL — otherwise it swallows a user
+# legitimately sending the same text twice.
+CONTENT_DEDUP_TTL_SECONDS = 15
 
 
 def _is_stale_session_ret(
@@ -256,6 +260,32 @@ MSG_STATE_FINISH = 2
 
 TYPING_START = 1
 TYPING_STOP = 2
+
+# Management commands may only be exercised from the Telegram admin channel.
+# The WeChat inbound path refuses them outright rather than forwarding them to
+# the globally-registered command handlers.
+_ADMIN_COMMANDS = frozenset(
+    {
+        "/wechat-login", "/wechat_login",
+        "/wechat-list", "/wechat_list",
+        "/wechat-users", "/wechat_users",
+        "/approve_wechat", "/approve-wechat",
+        "/reject_wechat", "/reject-wechat",
+    }
+)
+
+ADMIN_COMMAND_REFUSAL = "❌ 该命令为管理员命令，仅限管理员在 Telegram 渠道使用。"
+
+
+def _is_admin_command(text: str) -> bool:
+    """True when *text* invokes one of the Telegram-only management commands."""
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return False
+    # Split on whitespace and '@' so "/wechat-login@bot extra args" is caught too.
+    head = stripped.split()[0].split("@", 1)[0].lower()
+    return head in _ADMIN_COMMANDS
+
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
@@ -1331,6 +1361,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         self._token_store = ContextTokenStore(hermes_home)
         self._typing_cache = TypingTicketCache()
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        self._content_dedup = MessageDeduplicator(ttl_seconds=CONTENT_DEDUP_TTL_SECONDS)
         # (account_id is passed through method params, no shared instance variable needed)
 
         # Shared settings
@@ -1369,6 +1400,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         self._sync_bufs: Dict[str, str] = {}
         # Map chat_id → account_id so replies use the same account
         self._chat_to_account: Dict[str, str] = {}
+        self._pending_qr_task: Optional[asyncio.Task] = None
         # Track acquired platform locks for clean release
         self._acquired_locks: List[str] = []
 
@@ -1478,7 +1510,6 @@ class WeixinMultiAdapter(BasePlatformAdapter):
 
         # Initialize sessions for each account and start polling
         _no_aiohttp_timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None)
-        ssl_connector = _make_ssl_connector()
 
         for acc_id, acc_state in list(self._accounts.items()):
             token = acc_state["token"]
@@ -1494,8 +1525,13 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] Token lock unavailable for %s (non-fatal): %s", self.name, _safe_id(acc_id), exc)
 
-            poll_session = aiohttp.ClientSession(trust_env=True, connector=ssl_connector)
-            send_session = aiohttp.ClientSession(trust_env=True, connector=ssl_connector, timeout=_no_aiohttp_timeout)
+            # One connector per session: a ClientSession owns (and closes) its
+            # connector, so sharing one across accounts would let the first
+            # close() tear down every other account's connectivity.
+            poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
+            send_session = aiohttp.ClientSession(
+                trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout
+            )
 
             self._poll_sessions[acc_id] = poll_session
             self._send_sessions[acc_id] = send_session
@@ -1579,15 +1615,14 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                                 n += 1
                             acct_id = f"wechat-{n}"
                             
-                            account_file = os.path.join(accounts_dir, f"{acct_id}.json")
-                            with open(account_file, "w") as f:
-                                json.dump({
-                                    "token": token_new,
-                                    "base_url": base_url_new,
-                                    "cdn_base_url": WEIXIN_CDN_BASE_URL,
-                                    "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                }, f, indent=2)
-                            
+                            # Canonical helper: atomic write + chmod 0600.
+                            save_weixin_account(
+                                hermes_home,
+                                account_id=acct_id,
+                                token=token_new,
+                                base_url=base_url_new,
+                            )
+
                             self._accounts[acct_id] = {
                                 "token": token_new,
                                 "base_url": base_url_new,
@@ -1637,6 +1672,17 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             await session.close()
 
     async def disconnect(self) -> None:
+        # Stop the pending-QR watcher first, or a reconnect would leave a second
+        # one running (duplicate pollers can register the same account twice).
+        pending_qr_task = getattr(self, "_pending_qr_task", None)
+        if pending_qr_task is not None and not pending_qr_task.done():
+            pending_qr_task.cancel()
+            try:
+                await pending_qr_task
+            except asyncio.CancelledError:
+                pass
+        self._pending_qr_task = None
+
         # Clean up all poll tasks
         for acc_id, task in list(self._poll_tasks.items()):
             if acc_id in self._accounts:
@@ -1775,12 +1821,15 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         if message_id and self._dedup.is_duplicate(message_id):
             return
 
-        # Secondary content-fingerprint dedup for text messages
+        # Secondary content-fingerprint dedup, as a safety net for redelivery
+        # without a stable message_id. Deliberately short-lived and scoped per
+        # account: a user legitimately repeating themselves ("确认", "/new")
+        # must not be silently dropped.
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)
         if text:
-            content_key = f"content:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
-            if self._dedup.is_duplicate(content_key):
+            content_key = f"content:{account_id}:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
+            if self._content_dedup.is_duplicate(content_key):
                 logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
                 return
 
@@ -1812,15 +1861,6 @@ class WeixinMultiAdapter(BasePlatformAdapter):
 
             if not text and not media_paths:
                 return
-
-            # ---- Multi-account commands ----
-            if text and text.strip().lower() == "/wechat-list":
-                asyncio.create_task(self._cmd_wechat_list(effective_chat_id, account_id, context_token))
-                return
-            if text and text.strip().lower() == "/wechat-login":
-                asyncio.create_task(self._cmd_wechat_login(effective_chat_id, account_id, context_token))
-                return
-            # ---- End commands ----
 
             # Record chat→account mapping for replies
             self._chat_to_account[effective_chat_id] = account_id
@@ -1871,6 +1911,19 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                     return
             # ---- End Approval Check ----
 
+            # ---- Management commands are Telegram-only ----
+            # Registered commands are global, so a WeChat message reaching
+            # handle_message() could otherwise invoke them. Stop them here,
+            # after the approval gate so unapproved senders cannot probe.
+            if text and _is_admin_command(text):
+                logger.warning(
+                    "[%s] Refused management command from weixin user=%s: %s",
+                    self.name, _safe_id(sender_id), text.strip().split()[0],
+                )
+                asyncio.create_task(self.send(effective_chat_id, ADMIN_COMMAND_REFUSAL))
+                return
+            # ---- End management command check ----
+
             source = self.build_source(
                 chat_id=effective_chat_id,
                 chat_type=chat_type,
@@ -1898,23 +1951,14 @@ class WeixinMultiAdapter(BasePlatformAdapter):
 
     def _get_or_create_user_profile(self, user_id: str) -> str:
         """Auto-create an independent Hermes profile for a user if not exists."""
-        from hermes_cli.profiles import create_profile, profile_exists
-        raw_id = user_id.split('@')[0] if '@' in user_id else user_id
-        clean_id = re.sub(r'[^a-zA-Z0-9_]', '_', raw_id).lower()[:26]
-        profile_name = f"wx_{clean_id}"
         try:
-            if not profile_exists(profile_name):
-                logger.info("[%s] Auto-creating independent profile for user=%s -> %s", self.name, user_id, profile_name)
-                pdir = create_profile(profile_name, clone_from="default", clone_config=True, no_alias=True)
-                mem_dir = os.path.join(pdir, "memories")
-                os.makedirs(mem_dir, exist_ok=True)
-                with open(os.path.join(mem_dir, "USER.md"), "w") as uf:
-                    uf.write("_Learn about the person you\'re helping. Update this as you go.\n§\n**Name:**\n§\n**What to call them:**\n§\n**Pronouns:** _(optional)_\n§\n**Timezone:**\n§\n**Notes:**\n")
-                with open(os.path.join(mem_dir, "MEMORY.md"), "w") as mf:
-                    mf.write("")
-            return profile_name
+            import auth_manager
+        except ImportError:
+            from . import auth_manager
+        try:
+            return auth_manager.ensure_user_profile(user_id)
         except Exception as e:
-            logger.error("[%s] Failed to auto-create profile %s: %s", self.name, profile_name, e)
+            logger.error("[%s] Failed to auto-create profile for %s: %s", self.name, _safe_id(user_id), e)
             return "weixin"
 
     @property
@@ -1965,276 +2009,6 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         account = self._accounts.get(acc_id, {})
         session = self._send_sessions.get(acc_id)
         return session, account, acc_id
-
-    async def _send_reply(self, chat_id: str, text: str) -> None:
-        """Send a simple text reply using the account that received the message."""
-        send_session, account, acc_id = self._get_send_session(chat_id)
-        token = account.get("token", "")
-        base_url = account.get("base_url", ILINK_BASE_URL)
-        if not send_session or not token:
-            logger.warning("[%s] Cannot send reply: no session for chat %s", self.name, _safe_id(chat_id))
-            return
-        try:
-            await _send_message(
-                send_session,
-                base_url=base_url,
-                token=token,
-                to=chat_id,
-                text=self.format_message(text),
-                context_token=self._token_store.get(acc_id, chat_id),
-                client_id=f"hermes-weixin-cmd-{uuid.uuid4().hex}",
-            )
-        except Exception as exc:
-            logger.error("[%s] Failed to send reply to %s: %s", self.name, _safe_id(chat_id), exc)
-
-    async def _cmd_wechat_list(self, chat_id: str, account_id: str, context_token: Optional[str]) -> None:
-        """Handle /wechat-list: show all accounts and their status."""
-        lines = ["📋 微信账号列表："]
-        if not self._accounts:
-            lines.append("  (没有配置任何账号)")
-        else:
-            for acc_id, acc_state in self._accounts.items():
-                token = acc_state.get("token", "")[:12] + "..." if acc_state.get("token") else "无token"
-                poll_running = acc_id in self._poll_tasks and not self._poll_tasks[acc_id].done()
-                status_icon = "✅" if poll_running else "❌"
-                status_text = "在线" if poll_running else "离线"
-                lines.append(f"  {status_icon} {acc_id} ({status_text})")
-
-        lines.append(f"\n共 {len(self._accounts)} 个账号")
-        lines.append("\n发送 /wechat-login 添加新账号")
-        await self._send_reply(chat_id, "\n".join(lines))
-
-    async def _send_qr_image(self, chat_id: str, qrcode_url: str, qrcode_value: str) -> bool:
-        """Download QR image from URL or generate from token, send to chat.
-        Returns True if sent successfully, False otherwise.
-        """
-        # Try remote URL first
-        if qrcode_url and qrcode_url.startswith(("http://", "https://")):
-            try:
-                result = await self.send_image(
-                    chat_id=chat_id,
-                    image_url=qrcode_url,
-                    caption="📱 请用微信扫描二维码登录",
-                )
-                if result.success:
-                    return True
-            except Exception as exc:
-                logger.warning("[%s] Failed to send remote QR image: %s", self.name, exc)
-
-        # Generate local QR code as fallback
-        return await self._send_qr_image_local(chat_id, qrcode_url, qrcode_value)
-
-    async def _send_qr_image_local(self, chat_id: str, qrcode_url: str, qrcode_value: str) -> bool:
-        """Generate local QR code image and send to chat. Always uses local generation."""
-        try:
-            import qrcode as _qrcode
-            import io as _io
-
-            qr = _qrcode.QRCode(version=1, box_size=10, border=2)
-            qr.add_data(qrcode_url if qrcode_url else qrcode_value)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-
-            buf = _io.BytesIO()
-            img.save(buf, format="PNG")
-            buf.seek(0)
-
-            tmp_path = os.path.join(tempfile.gettempdir(), f"wechat_qr_{uuid.uuid4().hex[:8]}.png")
-            with open(tmp_path, "wb") as f:
-                f.write(buf.read())
-            file_size = os.path.getsize(tmp_path)
-            print(f"[WEIXIN-MULTI] QR file created: {tmp_path} size={file_size}", flush=True)
-
-            result = await self.send_image_file(
-                chat_id=chat_id,
-                image_path=tmp_path,
-                caption=None,  # No caption - pure image message
-            )
-            file_exists_after = os.path.exists(tmp_path)
-            print(f"[WEIXIN-MULTI] send_image_file result: success={result.success} error={result.error} msg_id={result.message_id} file_after={file_exists_after}", flush=True)
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            return result.success
-        except Exception as exc:
-            logger.error("[%s] Failed to generate local QR: %s", self.name, exc)
-            return False
-
-    async def _cmd_wechat_login(self, chat_id: str, account_id: str, context_token: Optional[str]) -> None:
-        """Handle /wechat-login: start QR login flow and add new account."""
-        await self._send_reply(chat_id, "📱 正在获取二维码，请稍候...")
-
-        if not AIOHTTP_AVAILABLE:
-            await self._send_reply(chat_id, "❌ 错误：aiohttp 未安装，无法进行登录")
-            return
-
-        try:
-            async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
-                # Step 1: Get QR code
-                qr_resp = await _api_get(
-                    session,
-                    base_url=ILINK_BASE_URL,
-                    endpoint=f"{EP_GET_BOT_QR}?bot_type=3",
-                    timeout_ms=QR_TIMEOUT_MS,
-                )
-                qrcode_value = str(qr_resp.get("qrcode") or "")
-                qrcode_url = str(qr_resp.get("qrcode_img_content") or "")
-                if not qrcode_value:
-                    await self._send_reply(chat_id, "❌ 获取二维码失败：服务端无响应")
-                    return
-
-                qr_link = qrcode_url if qrcode_url else qrcode_value
-                # Send text link
-                await self._send_reply(chat_id, f"📱 请用微信扫描以下二维码登录：\n\n{qr_link}\n\n⏳ 二维码5分钟内有效，请尽快扫描。\n扫码后手机上点「确认」，Gateway 会自动完成登录。")
-                # Send QR image (fixed filename per session, overwrite each time, never delete)
-                try:
-                    import qrcode as _qrcode
-                    import io as _io
-                    qr = _qrcode.QRCode(version=1, box_size=10, border=2)
-                    qr.add_data(qrcode_url if qrcode_url else qrcode_value)
-                    qr.make(fit=True)
-                    img = qr.make_image(fill_color="black", back_color="white")
-                    buf = _io.BytesIO()
-                    img.save(buf, format="PNG")
-                    buf.seek(0)
-                    # 固定文件名：基于 chat_id，每次覆盖
-                    safe_id = chat_id.replace("@", "_").replace(":", "_").replace("/", "_")
-                    tmp_path = os.path.join(tempfile.gettempdir(), f"hmes_wxqr_{safe_id}.png")
-                    with open(tmp_path, "wb") as f:
-                        f.write(buf.read())
-                    print(f"[WEIXIN-MULTI] QR file: {tmp_path} size={os.path.getsize(tmp_path)}", flush=True)
-                    result = await self.send_image_file(chat_id=chat_id, image_path=tmp_path, caption=None)
-                    print(f"[WEIXIN-MULTI] send_image_file: success={result.success} error={result.error}", flush=True)
-                except Exception as e:
-                    print(f"[WEIXIN-MULTI] QR image error: {e}", flush=True)
-
-                # Step 3: Poll for QR scan status
-                deadline = time.monotonic() + 300  # 5 min timeout
-                current_base_url = ILINK_BASE_URL
-                refresh_count = 0
-                sent_scan_notice = False
-                success = False
-
-                while time.monotonic() < deadline:
-                    try:
-                        status_resp = await _api_get(
-                            session,
-                            base_url=current_base_url,
-                            endpoint=f"{EP_GET_QR_STATUS}?qrcode={qrcode_value}",
-                            timeout_ms=QR_TIMEOUT_MS,
-                        )
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(1)
-                        continue
-                    except Exception as exc:
-                        logger.warning("[%s] QR poll error: %s", self.name, exc)
-                        await asyncio.sleep(1)
-                        continue
-
-                    status = str(status_resp.get("status") or "wait")
-                    if status == "wait":
-                        await asyncio.sleep(2)
-                    elif status == "scaned" and not sent_scan_notice:
-                        await self._send_reply(chat_id, "✅ 已扫码，请在手机上确认...")
-                        sent_scan_notice = True
-                        await asyncio.sleep(2)
-                    elif status == "scaned_but_redirect":
-                        redirect_host = str(status_resp.get("redirect_host") or "")
-                        if redirect_host:
-                            current_base_url = f"https://{redirect_host}"
-                        await asyncio.sleep(2)
-                    elif status == "expired":
-                        refresh_count += 1
-                        if refresh_count > 3:
-                            await self._send_reply(chat_id, "❌ 登录超时：二维码多次过期，请重新发送 /wechat-login")
-                            return
-                        # Refresh QR code
-                        await self._send_reply(chat_id, f"🔄 二维码已过期，正在刷新... ({refresh_count}/3)")
-                        qr_resp = await _api_get(
-                            session,
-                            base_url=ILINK_BASE_URL,
-                            endpoint=f"{EP_GET_BOT_QR}?bot_type=3",
-                            timeout_ms=QR_TIMEOUT_MS,
-                        )
-                        qrcode_value = str(qr_resp.get("qrcode") or "")
-                        qrcode_url = str(qr_resp.get("qrcode_img_content") or "")
-                        qr_link = qrcode_url if qrcode_url else qrcode_value
-                        await self._send_reply(chat_id, f"📱 新二维码：\n\n{qr_link}")
-                        # Send new QR image (overwrite same file)
-                        try:
-                            import qrcode as _qrcode
-                            import io as _io
-                            qr = _qrcode.QRCode(version=1, box_size=10, border=2)
-                            qr.add_data(qrcode_url if qrcode_url else qrcode_value)
-                            qr.make(fit=True)
-                            img = qr.make_image(fill_color="black", back_color="white")
-                            buf = _io.BytesIO()
-                            img.save(buf, format="PNG")
-                            buf.seek(0)
-                            safe_id = chat_id.replace("@", "_").replace(":", "_").replace("/", "_")
-                            tmp_path = os.path.join(tempfile.gettempdir(), f"hmes_wxqr_{safe_id}.png")
-                            with open(tmp_path, "wb") as f:
-                                f.write(buf.read())
-                            result = await self.send_image_file(chat_id=chat_id, image_path=tmp_path, caption=None)
-                            print(f"[WEIXIN-MULTI] refresh QR image: success={result.success}", flush=True)
-                        except Exception as e:
-                            print(f"[WEIXIN-MULTI] refresh QR image error: {e}", flush=True)
-                        sent_scan_notice = False
-                    elif status == "confirmed":
-                        acc_id_new = str(status_resp.get("ilink_bot_id") or "")
-                        token_new = str(status_resp.get("bot_token") or "")
-                        base_url_new = str(status_resp.get("baseurl") or ILINK_BASE_URL)
-                        user_id = str(status_resp.get("ilink_user_id") or "")
-
-                        if not acc_id_new or not token_new:
-                            await self._send_reply(chat_id, "❌ 登录成功但凭证不完整，请重试")
-                            return
-
-                        # Generate a human-friendly account ID
-                        generated_account_id = generateAccountId()
-
-                        # Save to config (persists to account file)
-                        saveAccountToConfig(str(get_hermes_home()), generated_account_id, {
-                            "token": token_new,
-                            "base_url": base_url_new,
-                            "cdn_base_url": WEIXIN_CDN_BASE_URL,
-                        })
-
-                        # Add to running adapter
-                        self._accounts[generated_account_id] = {
-                            "token": token_new,
-                            "base_url": base_url_new,
-                            "cdn_base_url": WEIXIN_CDN_BASE_URL,
-                        }
-
-                        # Start poll for new account
-                        _no_timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None)
-                        poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-                        send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector(), timeout=_no_timeout)
-                        self._poll_sessions[generated_account_id] = poll_session
-                        self._send_sessions[generated_account_id] = send_session
-
-                        sync_buf = _load_sync_buf(str(get_hermes_home()), generated_account_id)
-                        self._sync_bufs[generated_account_id] = sync_buf
-
-                        task = asyncio.create_task(
-                            self._poll_loop(generated_account_id),
-                            name=f"weixin-poll-{generated_account_id}",
-                        )
-                        self._poll_tasks[generated_account_id] = task
-                        _LIVE_ADAPTERS[token_new] = self
-                        accountPolling[generated_account_id] = {"running": True, "task": task}
-
-                        await self._send_reply(chat_id, f"✅ 微信登录成功！\n\n账号: {generated_account_id}\n已自动添加并开始轮询。\n\n💡 提示：所有新接入的微信用户均会自动创建专属独立 Profile；用户随时可发送【注销】或【/unregister】彻底清空自身数据。")
-                        logger.info("[%s] ✅ 新账号 %s 登录成功！", self.name, generated_account_id)
-                        success = True
-                        break
-
-                if not success:
-                    await self._send_reply(chat_id, "⏰ 登录超时，请重新发送 /wechat-login")
-
-        except Exception as exc:
-            logger.error("[%s] QR login error: %s", self.name, exc, exc_info=True)
-            await self._send_reply(chat_id, f"❌ 登录出错：{str(exc)[:200]}")
 
     async def _download_image(self, item: Dict[str, Any], account_id: str) -> Optional[str]:
         media = _media_reference(item, "image_item")

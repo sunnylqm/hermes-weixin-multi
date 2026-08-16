@@ -18,7 +18,8 @@
 | 功能 | 官方 `weixin` | 本插件 `weixin_multi` |
 |------|:------------:|:-------------------:|
 | 多账号支持 / Multi-account | ❌ 单账号 | ✅ 无限账号，动态添加 |
-| QR 扫码登录 / QR Login | ❌ CLI 本地 | ✅ 任何渠道（微信/Telegram/WebUI/CLI） |
+| QR 扫码登录 / QR Login | ❌ CLI 本地 | ✅ Telegram 管理员扫码添加 |
+| 管理命令渠道隔离 / Admin channel | ❌ 无 | ✅ **管理命令仅限 Telegram 管理员渠道** |
 | 独立 Profile 与记忆物理隔离 | ❌ 全局共享记忆 | ✅ **每个用户自动开通专属 Profile 与独立记忆** |
 | Telegram 管理员审批 | ❌ 仅配对码/白名单 | ✅ **Telegram 交互式按钮卡片直接批准/拒绝** |
 | 主动欢迎引导语 | ❌ 被动应答 | ✅ **批准后主动推送欢迎语，引导用户介绍称呼** |
@@ -100,13 +101,20 @@ hermes gateway restart
 
 ### Telegram 管理员指令
 
+> 🔒 **以下命令只能在 Telegram 管理员渠道执行。** 从微信渠道发送会被直接拒绝；
+> 从 WebUI / CLI 等无法验证来源的渠道调用时，结果（二维码、用户 ID、配对码）
+> 只会推送到 Telegram 管理员会话，调用方本身拿不到任何敏感信息。
+
 | 指令 | 说明 | 示例 |
 |------|------|------|
-| `/approve_wechat <配对码或用户ID>` | 批准微信用户加入，并自动创建专属独立 Profile | `/approve_wechat 123456` |
+| `/approve_wechat <配对码>` | 批准微信用户加入，并自动创建专属独立 Profile | `/approve_wechat a3f9c1d2` |
 | `/wechat-users` 或 `/wechat_users` | 查看当前已批准用户白名单及待审批列表 | `/wechat-users` |
-| `/reject_wechat <配对码或用户ID>` | 拒绝申请或撤销已有用户授权 | `/reject_wechat 123456` |
+| `/reject_wechat <配对码或用户ID>` | 拒绝申请或撤销已有用户授权 | `/reject_wechat a3f9c1d2` |
 | `/wechat-list` | 查看所有已连接的微信机器人账号状态 | `/wechat-list` |
 | `/wechat-login` | 生成二维码扫码添加新微信号 | `/wechat-login` |
+
+配对码是**高熵一次性凭据**，仅通过 Telegram 审批卡片下发。已验证身份的 Telegram
+管理员可直接用用户 ID 批准/撤销；其他来源必须出示配对码。
 
 ### 微信用户指令
 
@@ -124,9 +132,17 @@ Gateway (单进程)
 └── wechat-2 ── iLink API ── 📱 微信号 B
 
 用户数据存储 (物理隔离)
-├── ~/.hermes/profiles/wx_<用户A>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
-└── ~/.hermes/profiles/wx_<用户B>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
+├── ~/.hermes/profiles/wx_<sha256(用户A)[:16]>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
+└── ~/.hermes/profiles/wx_<sha256(用户B)[:16]>/ ── 独立 USER.md / MEMORY.md / sessions / state.db
 ```
+
+Profile 目录名取微信用户 ID 的 SHA-256 前 16 位。早期版本使用「小写化 + 非字母数字转 `_` +
+截断 26 字符」的命名，而微信 openid 长 28 字符且**大小写敏感**,不同用户可能落到同一目录、
+共用 `USER.md` 与 `MEMORY.md`。哈希命名消除了这一碰撞。
+
+> 🔄 **自动迁移**：老目录会在该用户下次发消息时自动改名到新命名，记忆不丢失。
+> 映射记录在 `~/.hermes/weixin/profile_map.json`。若两个用户此前正共用同一个老目录，
+> 只有先到者继承该目录，后到者获得全新空 Profile —— 不会把别人的数据继续带进来。
 
 - ✅ **每个微信用户拥有独立的专属 Profile 目录**
 - ✅ **用户间的个人画像（`USER.md`）与长期记忆（`MEMORY.md`）物理隔离，绝不串味**
@@ -135,12 +151,33 @@ Gateway (单进程)
 
 ---
 
+## 🔐 管理权限 / Admin Access Control
+
+管理命令的唯一合法入口是 **Telegram 管理员渠道**，由 `TELEGRAM_BOT_TOKEN` +
+`TELEGRAM_HOME_CHANNEL`（或 `TELEGRAM_ALLOWED_USERS`）确定管理员身份。三层判定：
+
+| 调用来源 | 行为 |
+|---|---|
+| Telegram 管理员会话 | ✅ 完整权限，结果内联返回 |
+| 微信渠道 | ❌ 在适配器入站阶段直接拒绝，命令不会到达处理器 |
+| WebUI / CLI / Agent 工具（来源不可验证） | ⚠️ 受限：敏感结果只推送到 Telegram 管理员会话；批准/撤销必须出示配对码 |
+
+**未配置 Telegram 时，所有管理命令一律禁用**（fail closed）。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `WEIXIN_ADMIN_CHANNEL` | `telegram` | 管理渠道。设为 `any` 可关闭该限制（**不推荐**，会恢复任意渠道可执行管理命令的旧行为） |
+| `WEIXIN_DEFAULT_APPROVED` | 空 | 逗号分隔的预批准微信用户 ID。**默认为空**；此处配置的 ID 会在每次启动时重新写回白名单，因而无法通过 `/reject_wechat` 撤销 |
+
+---
+
 ## ⚙️ 配置与存储路径 / Configuration
 
 - **已授权白名单**：`~/.hermes/weixin/approved_users.json`
 - **待审批申请列表**：`~/.hermes/weixin/pending_requests.json`
-- **微信账号凭证**：`~/.hermes/weixin/accounts/*.json`
-- **用户独立 Profile**：`~/.hermes/profiles/wx_<user_id>/`
+- **微信账号凭证**：`~/.hermes/weixin/accounts/*.json`（权限 `0600`）
+- **用户 Profile 映射**：`~/.hermes/weixin/profile_map.json`
+- **用户独立 Profile**：`~/.hermes/profiles/wx_<sha256(user_id)[:16]>/`
 
 ---
 

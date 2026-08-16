@@ -20,20 +20,28 @@ except ImportError:
     print("❌ aiohttp not installed. Run: pip install aiohttp")
     sys.exit(1)
 
-# iLink API endpoints
+# iLink API endpoints (leading slash matters — they are concatenated onto the
+# base URL, which has no trailing slash)
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
-EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
-EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
-EP_GET_BOT_INFO = "ilink/bot/get_bot_info"
+EP_GET_BOT_QR = "/ilink/bot/get_bot_qrcode"
+EP_GET_QR_STATUS = "/ilink/bot/get_qrcode_status"
+EP_GET_BOT_INFO = "/ilink/bot/get_bot_info"
 QR_TIMEOUT_MS = 5000
 LOGIN_TTL_SECONDS = 300  # 5 minutes
 
 def _make_ssl_connector():
-    """Create SSL connector that skips verification for iLink CDN."""
+    """Create a connector with certificate verification always on.
+
+    This link carries the bot token, so verification is never disabled. When
+    certifi is available its Mozilla CA bundle is used (some system CA stores
+    cannot verify ilinkai.weixin.qq.com); otherwise aiohttp's default applies.
+    """
     try:
-        return aiohttp.TCPConnector(ssl=False, limit=10)
-    except Exception:
-        return None
+        import ssl
+        import certifi
+        return aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where()), limit=10)
+    except ImportError:
+        return aiohttp.TCPConnector(limit=10)
 
 async def _api_get(session, base_url, endpoint, params=None, timeout_ms=5000):
     """GET request to iLink API."""
@@ -105,31 +113,32 @@ async def login():
                 
                 if token:
                     print(f"\n✅ 登录成功！")
-                    print(f"\nToken: {token}")
+                    # The token is a credential — never echo it to the terminal.
                     print(f"Base URL: {base_url}")
-                    
+
                     # Save token to accounts directory
                     from hermes_cli.config import get_hermes_home
                     hermes_home = str(get_hermes_home())
-                    
+
                     # Generate account ID
                     import uuid
                     account_id = f"wechat-{uuid.uuid4().hex[:8]}"
-                    
+
                     # Create accounts directory
                     accounts_dir = os.path.join(hermes_home, "weixin", "accounts")
                     os.makedirs(accounts_dir, exist_ok=True)
-                    
-                    # Save account file
+
+                    # Save account file (0600 — it holds the bot token)
                     account_file = os.path.join(accounts_dir, f"{account_id}.json")
-                    with open(account_file, "w") as f:
+                    fd = os.open(account_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w") as f:
                         json.dump({
                             "token": token,
                             "base_url": base_url,
                             "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
                             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         }, f, indent=2)
-                    
+
                     print(f"\n账号已保存: {account_id}")
                     print(f"配置文件: {account_file}")
                     print(f"\n请重启 Hermes gateway 使账号生效:")

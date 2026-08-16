@@ -20,6 +20,7 @@ config.yaml::
                 token: "..."
 """
 
+import html
 import importlib.util
 import json
 import os
@@ -105,6 +106,22 @@ EP_GET_BOT_QR = "/ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "/ilink/bot/get_qrcode_status"
 QR_TIMEOUT_MS = 5000
 
+def _make_verified_connector(aio):
+    """TCPConnector with certificate verification always on.
+
+    This link carries the bot token, so verification is never disabled. When
+    certifi is available its Mozilla CA bundle is used (some system CA stores
+    cannot verify ilinkai.weixin.qq.com); otherwise aiohttp's default
+    verification applies.
+    """
+    try:
+        import ssl
+        import certifi
+        return aio.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where()), limit=10)
+    except ImportError:
+        return aio.TCPConnector(limit=10)
+
+
 def _accounts_dir() -> str:
     hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
     return os.path.join(hermes_home, "weixin", "accounts")
@@ -135,8 +152,10 @@ def _save_account(account_id: str, token: str, base_url: str = "") -> str:
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     
+    # 0600 — this file holds the bot token.
     path = os.path.join(accounts_dir, f"{account_id}.json")
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(account_data, f, indent=2)
     return path
 
@@ -204,6 +223,43 @@ def _clear_pending_qr() -> None:
         os.remove(pending_file)
 
 
+# ── Admin authorization ──
+# Every command below is a management command and is Telegram-only. The host
+# registers commands globally (WebUI / CLI / Telegram / WeChat all reach the
+# same handler), so each handler must gate itself.
+
+_ADMIN_DISABLED_MSG = "❌ 授权模块不可用，微信管理命令已禁用。"
+
+
+def _auth_manager():
+    """Import auth_manager, or None when it is not installed alongside us."""
+    try:
+        import auth_manager  # type: ignore
+        return auth_manager
+    except ImportError:
+        try:
+            from . import auth_manager  # type: ignore
+            return auth_manager
+        except ImportError:
+            return None
+
+
+def _guard(*args, **kwargs):
+    """Authorize a management command.
+
+    Returns ``(auth_manager, verdict, denial_message)``. When *denial_message*
+    is non-empty the caller must return it unchanged and do nothing else.
+    Fails closed: no auth_manager means no management commands.
+    """
+    am = _auth_manager()
+    if am is None:
+        return None, None, _ADMIN_DISABLED_MSG
+    verdict, message = am.authorize_admin(*args, **kwargs)
+    if verdict == am.ADMIN_DENIED:
+        return am, verdict, message or am.ADMIN_ONLY_HINT
+    return am, verdict, ""
+
+
 def register(ctx):
     """
     Plugin entry point — called by Hermes plugin system.
@@ -257,25 +313,30 @@ def register(ctx):
     # process (gateway or WebUI) — they use iLink API directly and
     # read/write account files on disk, no adapter instance needed.
 
-    async def _handle_wechat_login_cmd(raw_args: str) -> str:
-        """Global /wechat-login: generate QR and wait for scan.
+    async def _handle_wechat_login_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        """Global /wechat-login: generate QR and wait for scan — Telegram admin only.
 
-        Works in WebUI, Telegram, CLI — anywhere Hermes runs.
-        Can also be invoked by AI agent via wechat_login tool.
+        Whoever scans the QR gets a bot account attached to this Hermes
+        instance, so the QR is only ever delivered to the Telegram admin chat.
+        A caller we cannot prove to be the Telegram admin gets an
+        acknowledgement and nothing else.
         Saves token to ~/.hermes/weixin/accounts/<id>.json on success.
         """
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
+        if verdict == am.ADMIN_UNVERIFIED and not am.throttle("wechat-login", 60.0):
+            return "⏳ 请求过于频繁，请稍后再试（二维码已发送至 Telegram 管理员会话）。"
+
         try:
             import aiohttp as aio
         except ImportError:
             return "❌ aiohttp 未安装。请运行: pip install aiohttp"
 
         try:
-            ssl_ctx = aio.TCPConnector(ssl=False, limit=10)
-        except Exception:
-            ssl_ctx = None
-
-        try:
-            async with aio.ClientSession(trust_env=True, connector=ssl_ctx) as session:
+            async with aio.ClientSession(
+                trust_env=True, connector=_make_verified_connector(aio)
+            ) as session:
                 # Step 1: Get QR code
                 url = f"{ILINK_BASE_URL}{EP_GET_BOT_QR}?bot_type=3"
                 timeout = aio.ClientTimeout(total=QR_TIMEOUT_MS / 1000)
@@ -293,34 +354,56 @@ def register(ctx):
                 # Store pending QR for gateway to poll
                 _save_pending_qr(qrcode_value, qr_link)
 
-                return (
+                body = (
                     f"📱 微信扫码登录\n\n"
                     f"请用微信扫描：\n"
                     f"{qr_link}\n\n"
                     f"⏳ 二维码5分钟内有效\n\n"
                     f"扫码后手机上点「确认」即可完成登录。\n"
-                    f"用 /wechat-list 查看账号状态。\n\n"
-                    f"💡 提示：如果输入 /wechat-login 后无反应，请刷新 WebUI 页面重试。"
+                    f"用 /wechat-list 查看账号状态。"
+                )
+                # The QR is a credential — deliver it to the Telegram admin chat.
+                am.send_telegram_notification(
+                    "📱 <b>微信扫码登录</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"请用微信扫描：\n<code>{html.escape(qr_link)}</code>\n\n"
+                    "⏳ 二维码 5 分钟内有效，扫码后在手机上点「确认」即可完成登录。"
+                )
+                if verdict == am.ADMIN_OK:
+                    return body
+                return (
+                    "✅ 二维码已发送至 Telegram 管理员会话。\n"
+                    "请在 Telegram 中查看并扫码完成登录。"
                 )
         except Exception as e:
             return f"❌ 获取二维码失败: {e}"
 
-    def _handle_wechat_list_cmd(raw_args: str) -> str:
-        """Global /wechat-list: show all accounts and status.
-        
+    def _handle_wechat_list_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        """Global /wechat-list: show all accounts and status — Telegram admin only.
+
         Works from any process — reads account files from disk.
         """
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
+
         accounts = _list_accounts()
         if not accounts:
-            return "📱 暂无微信账号。发送 /wechat-login 添加第一个账号。"
+            body = "📱 暂无微信账号。在 Telegram 发送 /wechat-login 添加第一个账号。"
+        else:
+            lines = ["📱 Weixin Multi 账号列表：\n"]
+            for acc in accounts:
+                has_token = "✅" if acc.get("token") and acc["token"] != "???" else "❌"
+                lines.append(f"  {has_token} {acc['id']} — token={'已配置' if has_token == '✅' else '未配置'}")
+            lines.append(f"\n共 {len(accounts)} 个账号")
+            lines.append("在 Telegram 发送 /wechat-login 添加新账号")
+            body = "\n".join(lines)
 
-        lines = ["📱 Weixin Multi 账号列表：\n"]
-        for acc in accounts:
-            has_token = "✅" if acc.get("token") and acc["token"] != "???" else "❌"
-            lines.append(f"  {has_token} {acc['id']} — token={'已配置' if has_token == '✅' else '未配置'}")
-        lines.append(f"\n共 {len(accounts)} 个账号")
-        lines.append("发送 /wechat-login 添加新账号")
-        return "\n".join(lines)
+        if verdict == am.ADMIN_OK:
+            return body
+        if am.throttle("wechat-list", 30.0):
+            am.send_telegram_notification(f"<pre>{html.escape(body)}</pre>")
+        return "✅ 账号列表已发送至 Telegram 管理员会话。"
 
     ctx.register_command(
         name="wechat-login",
@@ -334,48 +417,62 @@ def register(ctx):
     )
 
     # ── Telegram User Approval Commands ──
-    async def _handle_approve_wechat_cmd(raw_args: str) -> str:
+    async def _handle_approve_wechat_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
         arg = (raw_args or "").strip()
         if not arg:
-            return "❌ 请输入申请配对码或微信用户 ID。\n例如：/approve_wechat 123456"
-        try:
-            import auth_manager
-        except ImportError:
-            from . import auth_manager
-        success, msg, target_user, account_id = auth_manager.approve_user_request(arg)
+            return "❌ 请输入申请配对码。\n例如：/approve_wechat a3f9c1d2"
+        # Unverified callers must present the pairing code, which only ever
+        # reaches the Telegram admin chat — approval stays a Telegram capability.
+        success, msg, target_user, account_id = am.approve_user_request(
+            arg, allow_user_id=(verdict == am.ADMIN_OK)
+        )
+        if success and verdict != am.ADMIN_OK:
+            am.send_telegram_notification(f"✅ {html.escape(msg)}")
         return msg
 
-    def _handle_wechat_users_cmd(raw_args: str) -> str:
-        try:
-            import auth_manager
-        except ImportError:
-            from . import auth_manager
-        status = auth_manager.list_auth_status()
+    def _handle_wechat_users_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
+
+        status = am.list_auth_status()
         approved = status.get("approved", {})
         pending = status.get("pending", {})
-        
+
         lines = ["👥 微信用户授权状态：\n"]
         lines.append(f"【已批准用户 ({len(approved)})】")
         for u, meta in approved.items():
             lines.append(f"  ✅ {u}")
-            
+
         lines.append(f"\n【待审批申请 ({len(pending)})】")
         for code, info in pending.items():
             lines.append(f"  ⏳ 配对码: {code} | 用户: {info.get('user_id')}")
-            
+
         if pending:
             lines.append("\n👉 输入 /approve_wechat <配对码> 即可批准。")
-        return "\n".join(lines)
+        body = "\n".join(lines)
 
-    def _handle_reject_wechat_cmd(raw_args: str) -> str:
+        if verdict == am.ADMIN_OK:
+            return body
+        # User IDs and pairing codes are secrets — never echo them to an
+        # unverified caller; push the listing to the Telegram admin instead.
+        if am.throttle("wechat-users", 30.0):
+            am.send_telegram_notification(f"<pre>{html.escape(body)}</pre>")
+        return "✅ 授权状态已发送至 Telegram 管理员会话。"
+
+    def _handle_reject_wechat_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
         arg = (raw_args or "").strip()
         if not arg:
-            return "❌ 请输入申请配对码或微信用户 ID。\n例如：/reject_wechat 123456"
-        try:
-            import auth_manager
-        except ImportError:
-            from . import auth_manager
-        success, msg = auth_manager.reject_user_request(arg)
+            return "❌ 请输入申请配对码或微信用户 ID。\n例如：/reject_wechat a3f9c1d2"
+        success, msg = am.reject_user_request(arg, allow_user_id=(verdict == am.ADMIN_OK))
+        if success and verdict != am.ADMIN_OK:
+            am.send_telegram_notification(f"🚫 {html.escape(msg)}")
         return msg
 
     ctx.register_command(
@@ -414,8 +511,8 @@ def register(ctx):
         name="wechat_login",
         toolset="hermes-cli",
         schema={
-            "description": "添加新的微信账号到 Hermes（扫码登录）。"
-                           "生成二维码让用户用微信扫描并确认，扫码后自动完成添加。",
+            "description": "添加新的微信账号到 Hermes（扫码登录）。仅限管理员在 Telegram 渠道使用；"
+                           "从其他渠道调用时，二维码只会发送到 Telegram 管理员会话。",
             "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_wechat_login_cmd,
@@ -426,7 +523,8 @@ def register(ctx):
         name="wechat_list",
         toolset="hermes-cli",
         schema={
-            "description": "查看所有已连接的微信账号及其状态。",
+            "description": "查看所有已连接的微信账号及其状态。仅限管理员在 Telegram 渠道使用；"
+                           "从其他渠道调用时，结果只会发送到 Telegram 管理员会话。",
             "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_wechat_list_cmd,
