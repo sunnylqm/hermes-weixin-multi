@@ -324,6 +324,60 @@ def forget_profile_mapping(user_id: str) -> None:
         _save_json(PROFILE_MAP_FILE, data)
 
 
+# A profile cloned from "default" inherits its .env verbatim, including the
+# shared platform credentials. That makes every per-user profile try to start
+# its own Telegram/Discord/WeChat adapters (the gateway then refuses them as
+# duplicate-credential) and leaves a copy of the master bot tokens in each
+# user's directory. Strip platform credentials — but never the model API keys,
+# which the per-user agent needs to run.
+_PLATFORM_CREDENTIAL_RE = re.compile(
+    r"^(TELEGRAM|DISCORD|SLACK|WHATSAPP|SIGNAL|MATRIX|LINE|VIBER|TWILIO|WEIXIN"
+    r"|WECHAT|MESSENGER|INSTAGRAM|IMESSAGE|RELAY)_[A-Z0-9_]*"
+    r"(TOKEN|SECRET|PASSWORD|CREDENTIAL)$"
+)
+_EXTRA_SCRUBBED_ENV_KEYS = frozenset({"HERMES_GATEWAY_TOKEN"})
+
+
+def _is_platform_credential(key: str) -> bool:
+    return bool(_PLATFORM_CREDENTIAL_RE.match(key)) or key in _EXTRA_SCRUBBED_ENV_KEYS
+
+
+def scrub_platform_credentials(env_path: str) -> List[str]:
+    """Remove inherited platform credentials from a profile .env. Returns removed keys."""
+    if not os.path.exists(env_path):
+        return []
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.warning("[Weixin Auth] Could not read %s: %s", env_path, e)
+        return []
+
+    removed, kept = [], []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key and not line.lstrip().startswith("#") and _is_platform_credential(key):
+            removed.append(key)
+        else:
+            kept.append(line)
+
+    if removed:
+        try:
+            fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            # O_CREAT's mode is ignored for an existing file — set it explicitly.
+            os.chmod(env_path, 0o600)
+            logger.info(
+                "[Weixin Auth] Stripped %d inherited platform credential(s) from %s: %s",
+                len(removed), env_path, ", ".join(removed),
+            )
+        except OSError as e:
+            logger.error("[Weixin Auth] Could not rewrite %s: %s", env_path, e)
+            return []
+    return removed
+
+
 USER_MD_TEMPLATE = (
     "_Learn about the person you're helping. Update this as you go.\n§\n"
     "**Name:**\n§\n**What to call them:**\n§\n**Pronouns:** _(optional)_\n§\n"
@@ -356,6 +410,9 @@ def ensure_user_profile(user_id: str) -> str:
                     yaml.safe_dump(cfg, f, default_flow_style=False, allow_unicode=True)
         except Exception as e:
             logger.warning("[Weixin Auth] Could not scrub platforms from %s: %s", cfg_path, e)
+
+    # Same reason, for credentials inherited through the cloned .env.
+    scrub_platform_credentials(os.path.join(pdir, ".env"))
 
     mem_dir = os.path.join(pdir, "memories")
     os.makedirs(mem_dir, exist_ok=True)
