@@ -198,6 +198,14 @@ API_TIMEOUT_MS = 15_000
 CONFIG_TIMEOUT_MS = 10_000
 QR_TIMEOUT_MS = 35_000
 
+# How long a scan-to-connect window stays open: the QR is shown, then we wait
+# for the person to scan and confirm in WeChat. 5 minutes was too tight in
+# practice, so both the CLI flow and the WebUI pending_qr.json share 15 minutes.
+QR_LOGIN_TTL_SECONDS = 900
+# The QR itself expires server-side well before the window does, so allow enough
+# refreshes to cover the full TTL instead of giving up a few minutes in.
+MAX_QR_REFRESHES = 10
+
 MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
 BACKOFF_DELAY_SECONDS = 30
@@ -1203,7 +1211,7 @@ async def qr_login(
     hermes_home: str,
     *,
     bot_type: str = "3",
-    timeout_seconds: int = 480,
+    timeout_seconds: int = QR_LOGIN_TTL_SECONDS,
 ) -> Optional[Dict[str, str]]:
     """
     Run the interactive iLink QR login flow.
@@ -1279,10 +1287,10 @@ async def qr_login(
                     current_base_url = f"https://{redirect_host}"
             elif status == "expired":
                 refresh_count += 1
-                if refresh_count > 3:
+                if refresh_count > MAX_QR_REFRESHES:
                     print("\n二维码多次过期，请重新执行登录。")
                     return None
-                print(f"\n二维码已过期，正在刷新... ({refresh_count}/3)")
+                print(f"\n二维码已过期，正在刷新... ({refresh_count}/{MAX_QR_REFRESHES})")
                 try:
                     qr_resp = await _api_get(
                         session,
@@ -1611,7 +1619,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                     qrcode_value = pending.get("qrcode", "")
                     created_at = pending.get("created_at", 0)
                     
-                    if time.time() - created_at > 300:
+                    if time.time() - created_at > QR_LOGIN_TTL_SECONDS:
                         os.remove(pending_file)
                         await asyncio.sleep(5)
                         continue

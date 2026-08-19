@@ -27,7 +27,7 @@ EP_GET_BOT_QR = "/ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "/ilink/bot/get_qrcode_status"
 EP_GET_BOT_INFO = "/ilink/bot/get_bot_info"
 QR_TIMEOUT_MS = 5000
-LOGIN_TTL_SECONDS = 300  # 5 minutes
+LOGIN_TTL_SECONDS = 900  # 15 minutes
 
 def _make_ssl_connector():
     """Create a connector with certificate verification always on.

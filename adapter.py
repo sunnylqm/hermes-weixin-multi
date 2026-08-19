@@ -131,6 +131,9 @@ def _accounts_dir() -> str:
 _ACCOUNT_SIDECAR_SUFFIXES = (".sync.json", ".context-tokens.json")
 # Long-poll considered live if its sync buffer advanced within this window.
 _ACCOUNT_LIVE_WINDOW_SECONDS = 300
+# Scan-to-connect window: how long a generated QR stays usable while we wait for
+# the person to scan and confirm. Kept in sync with weixin.py QR_LOGIN_TTL_SECONDS.
+PENDING_QR_TTL_SECONDS = 900
 
 
 def _is_account_file(filename: str) -> bool:
@@ -259,8 +262,8 @@ def _load_pending_qr() -> Optional[dict]:
     try:
         with open(pending_file) as f:
             data = json.load(f)
-        # Expire after 5 minutes
-        if time.time() - data.get("created_at", 0) > 300:
+        # Expire once the scan window has passed
+        if time.time() - data.get("created_at", 0) > PENDING_QR_TTL_SECONDS:
             os.remove(pending_file)
             return None
         return data
