@@ -29,6 +29,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import struct
@@ -216,6 +217,9 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 # stays far shorter than the message_id TTL — otherwise it swallows a user
 # legitimately sending the same text twice.
 CONTENT_DEDUP_TTL_SECONDS = 15
+DEFAULT_SEND_MIN_INTERVAL_SECONDS = 0.8
+DEFAULT_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
 
 def _is_stale_session_ret(
@@ -1404,6 +1408,23 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
+        self._send_rate_limit_retries = max(
+            0,
+            int(
+                extra.get("send_rate_limit_retries")
+                or os.getenv("WEIXIN_SEND_RATE_LIMIT_RETRIES", str(DEFAULT_RATE_LIMIT_RETRIES))
+            ),
+        )
+        self._send_min_interval_seconds = max(
+            0.0,
+            float(
+                extra.get("send_min_interval_seconds")
+                or os.getenv(
+                    "WEIXIN_SEND_MIN_INTERVAL_SECONDS",
+                    str(DEFAULT_SEND_MIN_INTERVAL_SECONDS),
+                )
+            ),
+        )
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1429,6 +1450,19 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         self._sync_bufs: Dict[str, str] = {}
         # Map chat_id → account_id so replies use the same account
         self._chat_to_account: Dict[str, str] = {}
+        # Gateway status/interim messages and final replies can be scheduled
+        # from different tasks.  Keep each WeChat chat strictly ordered so a
+        # retry from an older message cannot overtake a newer final response.
+        self._send_locks: Dict[str, asyncio.Lock] = {}
+        # iLink frequency limits are account-scoped, not chat-scoped.  A
+        # second lock and minimum interval prevent two chats on one account
+        # from collectively hammering sendmessage.
+        self._account_send_locks: Dict[str, asyncio.Lock] = {}
+        self._last_account_send_at: Dict[str, float] = {}
+        # The gateway already serializes agent turns, but the adapter can
+        # observe multiple poll deliveries before that guard is reached.  A
+        # chat lock here prevents context-token/account races at the boundary.
+        self._inbound_locks: Dict[str, asyncio.Lock] = {}
         self._pending_qr_task: Optional[asyncio.Task] = None
         # Track acquired platform locks for clean release
         self._acquired_locks: List[str] = []
@@ -1735,6 +1769,10 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             if not session.closed:
                 await session.close()
         self._send_sessions.clear()
+        self._send_locks.clear()
+        self._account_send_locks.clear()
+        self._last_account_send_at.clear()
+        self._inbound_locks.clear()
 
         # Release all platform locks
         for lock_identity in self._acquired_locks:
@@ -1812,7 +1850,19 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                     _save_sync_buf(self._hermes_home, account_id, sync_buf)
 
                 for message in response.get("msgs") or []:
-                    asyncio.create_task(self._process_message_safe(account_id, message))
+                    message_id = str(message.get("message_id") or "").strip()
+                    sender_id = str(message.get("from_user_id") or "").strip()
+                    logger.debug(
+                        "[%s] inbound scheduled account=%s sender=%s message=%s",
+                        self.name,
+                        _safe_id(account_id),
+                        _safe_id(sender_id),
+                        _safe_id(message_id),
+                    )
+                    asyncio.create_task(
+                        self._process_message_safe(account_id, message),
+                        name=f"weixin-inbound-{_safe_id(account_id)}-{_safe_id(message_id)}",
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -1826,11 +1876,43 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         accountPolling.pop(account_id, None)
 
     async def _process_message_safe(self, account_id: str, message: Dict[str, Any]) -> None:
+        lock_key = self._inbound_lock_key(account_id, message)
+        lock = self._inbound_locks.setdefault(lock_key, asyncio.Lock()) if lock_key else None
         try:
-            await self._process_message(account_id, message)
+            if lock is None:
+                await self._process_message(account_id, message)
+            else:
+                if lock.locked():
+                    logger.info(
+                        "[%s] inbound queued account=%s chat=%s message=%s",
+                        self.name,
+                        _safe_id(account_id),
+                        _safe_id(lock_key),
+                        _safe_id(str(message.get("message_id") or "")),
+                    )
+                async with lock:
+                    await self._process_message(account_id, message)
         except Exception as exc:
             logger.error("[%s] unhandled inbound error from=%s acc=%s: %s",
                          self.name, _safe_id(message.get("from_user_id")), _safe_id(account_id), exc, exc_info=True)
+
+    @staticmethod
+    def _inbound_lock_key(account_id: str, message: Dict[str, Any]) -> Optional[str]:
+        """Return a stable logical-chat key for adapter-side serialization.
+
+        DM chat IDs are sender IDs and group chat IDs are room IDs, so the key
+        intentionally omits the account. This protects a shared user/profile
+        from two account pollers delivering the same event concurrently.
+        """
+        sender_id = str(message.get("from_user_id") or "").strip()
+        if not sender_id:
+            return None
+        try:
+            chat_type, chat_id = _guess_chat_type(message, account_id)
+        except Exception:
+            chat_type, chat_id = "dm", sender_id
+        chat_id = str(chat_id or sender_id).strip()
+        return f"{chat_type}:{chat_id}" if chat_id else None
 
     async def _process_message(self, account_id: str, message: Dict[str, Any]) -> None:
         if account_id not in self._poll_sessions:
@@ -1848,23 +1930,41 @@ class WeixinMultiAdapter(BasePlatformAdapter):
 
         message_id = str(message.get("message_id") or "").strip()
         if message_id and self._dedup.is_duplicate(message_id):
+            logger.info(
+                "[%s] inbound dedup reason=message_id account=%s sender=%s message=%s",
+                self.name,
+                _safe_id(account_id),
+                _safe_id(sender_id),
+                _safe_id(message_id),
+            )
             return
 
+        chat_type, effective_chat_id = _guess_chat_type(message, account_id)
+
         # Secondary content-fingerprint dedup, as a safety net for redelivery
-        # without a stable message_id. Deliberately short-lived and scoped per
-        # account: a user legitimately repeating themselves ("确认", "/new")
-        # must not be silently dropped.
+        # without a stable message_id. The key is logical-chat scoped rather
+        # than account scoped: if two account pollers receive the same event,
+        # only one agent turn should be admitted. The short TTL still permits
+        # a user to intentionally repeat a message later.
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)
         if text:
-            content_key = f"content:{account_id}:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
+            content_key = (
+                f"content:{chat_type}:{effective_chat_id}:"
+                f"{hashlib.md5(text.encode()).hexdigest()}"
+            )
             if self._content_dedup.is_duplicate(content_key):
-                logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
+                logger.info(
+                    "[%s] inbound dedup reason=content chat=%s sender=%s message=%s",
+                    self.name,
+                    _safe_id(effective_chat_id),
+                    _safe_id(sender_id),
+                    _safe_id(message_id),
+                )
                 return
 
         # account_id passed through to download methods (no shared instance variable)
         try:
-            chat_type, effective_chat_id = _guess_chat_type(message, account_id)
             if chat_type == "group":
                 if self._group_policy == "disabled":
                     return
@@ -2046,6 +2146,76 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         session = self._send_sessions.get(acc_id)
         return session, account, acc_id
 
+    def _send_lock_for(self, chat_id: str) -> asyncio.Lock:
+        """Return the per-chat outbound lock, creating it lazily."""
+        return self._send_locks.setdefault(chat_id, asyncio.Lock())
+
+    def _account_send_lock_for(self, account_id: str) -> asyncio.Lock:
+        """Return the account-wide iLink send lock, creating it lazily."""
+        return self._account_send_locks.setdefault(account_id, asyncio.Lock())
+
+    async def _wait_for_account_send_slot(self, account_id: str) -> None:
+        """Rate-limit send starts for one iLink account.
+
+        This runs while the caller holds the account send lock. Recording the
+        start time before the HTTP request prevents a burst after a slow call
+        completes, which is the pattern that previously triggered ret=-2.
+        """
+        now = time.monotonic()
+        last = self._last_account_send_at.get(account_id, 0.0)
+        wait = self._send_min_interval_seconds - (now - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_account_send_at[account_id] = time.monotonic()
+
+    async def _send_message_serialized(
+        self,
+        session: "aiohttp.ClientSession",
+        *,
+        account_id: str,
+        base_url: str,
+        token: str,
+        to: str,
+        text: str,
+        context_token: Optional[str],
+        client_id: str,
+    ) -> Dict[str, Any]:
+        """Send one text request through the account-level limiter."""
+        async with self._account_send_lock_for(account_id):
+            await self._wait_for_account_send_slot(account_id)
+            return await _send_message(
+                session,
+                base_url=base_url,
+                token=token,
+                to=to,
+                text=text,
+                context_token=context_token,
+                client_id=client_id,
+            )
+
+    async def _send_file_serialized(
+        self,
+        session: "aiohttp.ClientSession",
+        account: Dict[str, Any],
+        account_id: str,
+        chat_id: str,
+        path: str,
+        caption: str,
+        *,
+        force_file_attachment: bool = False,
+    ) -> str:
+        """Serialize media upload + send operations per iLink account."""
+        async with self._account_send_lock_for(account_id):
+            await self._wait_for_account_send_slot(account_id)
+            return await self._send_file(
+                session,
+                account,
+                chat_id,
+                path,
+                caption,
+                force_file_attachment=force_file_attachment,
+            )
+
     async def _download_image(self, item: Dict[str, Any], account_id: str) -> Optional[str]:
         media = _media_reference(item, "image_item")
         session = self._get_account_session(account_id)
@@ -2190,10 +2360,12 @@ class WeixinMultiAdapter(BasePlatformAdapter):
 
         last_error: Optional[Exception] = None
         retried_without_token = False
+        rate_limit_attempts = 0
         for attempt in range(self._send_chunk_retries + 1):
             try:
-                resp = await _send_message(
+                resp = await self._send_message_serialized(
                     send_session,
+                    account_id=acc_id,
                     base_url=base_url,
                     token=token,
                     to=chat_id,
@@ -2236,12 +2408,23 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
-                            if attempt >= self._send_chunk_retries:
+                            if rate_limit_attempts >= self._send_rate_limit_retries:
                                 break
-                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            rate_limit_attempts += 1
+                            wait = min(
+                                self._send_chunk_retry_delay_seconds
+                                * 3
+                                * (2 ** (rate_limit_attempts - 1)),
+                                MAX_RATE_LIMIT_BACKOFF_SECONDS,
+                            )
+                            wait += random.uniform(0.0, min(1.0, wait * 0.25))
                             logger.warning(
-                                "[%s] rate limited for %s; backing off %.1fs before retry",
-                                self.name, _safe_id(chat_id), wait,
+                                "[%s] rate limited for %s; backing off %.1fs before retry (%d/%d)",
+                                self.name,
+                                _safe_id(chat_id),
+                                wait,
+                                rate_limit_attempts,
+                                self._send_rate_limit_retries,
                             )
                             await asyncio.sleep(wait)
                             continue
@@ -2269,7 +2452,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         assert last_error is not None
         raise last_error
 
-    async def send(
+    async def _send_unlocked(
         self,
         chat_id: str,
         content: str,
@@ -2297,13 +2480,13 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         async def _deliver_media(path: str, is_voice: bool = False) -> None:
             ext = Path(path).suffix.lower()
             if is_voice or ext in _AUDIO_EXTS:
-                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+                await self._send_voice_unlocked(chat_id=chat_id, audio_path=path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
-                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                await self._send_video_unlocked(chat_id=chat_id, video_path=path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+                await self._send_document_unlocked(chat_id=chat_id, file_path=path, metadata=metadata)
             else:
-                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                await self._send_document_unlocked(chat_id=chat_id, file_path=path, metadata=metadata)
 
         try:
             # Deliver extracted MEDIA: attachments first.
@@ -2337,6 +2520,22 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Serialize all text/media delivery for one logical WeChat chat."""
+        async with self._send_lock_for(chat_id):
+            return await self._send_unlocked(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         send_session, account, _ = self._get_send_session(chat_id)
@@ -2422,7 +2621,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
-    async def send_document(
+    async def _send_document_unlocked(
         self,
         chat_id: str,
         file_path: str,
@@ -2433,18 +2632,25 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         del file_name, reply_to, metadata, kwargs
-        send_session, account, _ = self._get_send_session(chat_id)
+        send_session, account, acc_id = self._get_send_session(chat_id)
         token = account.get("token", "")
         if not send_session or not token:
             return SendResult(success=False, error="Not connected")
         try:
-            message_id = await self._send_file(send_session, account, chat_id, file_path, caption or "")
+            message_id = await self._send_file_serialized(
+                send_session,
+                account,
+                acc_id,
+                chat_id,
+                file_path,
+                caption or "",
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
-    async def send_video(
+    async def _send_video_unlocked(
         self,
         chat_id: str,
         video_path: str,
@@ -2452,18 +2658,25 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        send_session, account, _ = self._get_send_session(chat_id)
+        send_session, account, acc_id = self._get_send_session(chat_id)
         token = account.get("token", "")
         if not send_session or not token:
             return SendResult(success=False, error="Not connected")
         try:
-            message_id = await self._send_file(send_session, account, chat_id, video_path, caption or "")
+            message_id = await self._send_file_serialized(
+                send_session,
+                account,
+                acc_id,
+                chat_id,
+                video_path,
+                caption or "",
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
-    async def send_voice(
+    async def _send_voice_unlocked(
         self,
         chat_id: str,
         audio_path: str,
@@ -2471,7 +2684,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        send_session, account, _ = self._get_send_session(chat_id)
+        send_session, account, acc_id = self._get_send_session(chat_id)
         token = account.get("token", "")
         base_url = account.get("base_url", ILINK_BASE_URL)
         if not send_session or not token:
@@ -2482,8 +2695,10 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         # fallback so users at least receive playable audio, even for .silk.
         fallback_caption = caption or "[voice message as attachment]"
         try:
-            message_id = await self._send_file(
-                send_session, account,
+            message_id = await self._send_file_serialized(
+                send_session,
+                account,
+                acc_id,
                 chat_id,
                 audio_path,
                 fallback_caption,
@@ -2493,6 +2708,61 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        async with self._send_lock_for(chat_id):
+            return await self._send_document_unlocked(
+                chat_id,
+                file_path,
+                caption=caption,
+                file_name=file_name,
+                reply_to=reply_to,
+                metadata=metadata,
+                **kwargs,
+            )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        async with self._send_lock_for(chat_id):
+            return await self._send_video_unlocked(
+                chat_id,
+                video_path,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        async with self._send_lock_for(chat_id):
+            return await self._send_voice_unlocked(
+                chat_id,
+                audio_path,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url

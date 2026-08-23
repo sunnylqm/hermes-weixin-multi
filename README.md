@@ -88,6 +88,18 @@ gateway:
       extra:
         dm_policy: open
         allow_all_users: true
+
+# WeChat is a permanent-message channel: do not publish every tool-call
+# preamble as a separate user-visible message.
+display:
+  interim_assistant_messages: false
+  platforms:
+    weixin_multi:
+      streaming: false
+      interim_assistant_messages: false
+      tool_progress: off
+      long_running_notifications: false
+      busy_ack_detail: false
 ```
 
 并在 `~/.hermes/.env` 中加入:
@@ -113,6 +125,24 @@ WEIXIN_MULTI_ALLOW_ALL_USERS=true
 ```bash
 hermes gateway restart
 ```
+
+### 稳定性参数 / Stability controls
+
+`weixin_multi` serializes inbound turns per logical chat and outbound sends per
+chat/account. The defaults are conservative for iLink's frequency limits. They
+can be tuned under `gateway.platforms.weixin_multi.extra` or with environment
+variables:
+
+| 参数 | 默认值 | 作用 |
+|------|-------:|------|
+| `send_min_interval_seconds` | `0.8` | 同一微信账号两次发送的最小间隔 |
+| `send_rate_limit_retries` | `2` | `ret=-2` 限流错误的专用重试次数 |
+| `send_chunk_retries` | `4` | 非限流发送错误的重试次数 |
+| `send_chunk_retry_delay_seconds` | `1.0` | 普通错误的基础退避秒数 |
+
+出现限流时，插件会对 `ret=-2` 使用指数退避并加少量抖动；同一会话的
+旧消息不会越过正在发送的新消息。调整前应先观察 Gateway 日志中的
+`rate limited` 和 `inbound queued` 计数。
 
 ---
 
