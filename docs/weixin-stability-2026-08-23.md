@@ -33,15 +33,33 @@ which left a race around context tokens and account routing.
 
 ## Verification checklist
 
-- [ ] `python -m py_compile` passes for plugin modules.
-- [ ] Hermes core display-config test passes with `weixin_multi` mapped to the
+- [x] `python -m py_compile` passes for plugin modules.
+- [x] Hermes core display-config test passes with `weixin_multi` mapped to the
       low-capability tier.
-- [ ] SG and KR profiles contain the platform-specific quiet display settings.
-- [ ] After restart, one long tool chain produces one final WeChat reply.
-- [ ] Gateway logs show no interim-message flood; rate-limit retries remain
+- [x] SG and KR profiles contain the platform-specific quiet display settings.
+- [ ] After restart, one long tool chain produces one final WeChat reply. (No
+      new user turn was injected during deployment; runtime configuration and
+      delivery paths were smoke-tested without sending a synthetic message.)
+- [x] Gateway logs show no interim-message flood; rate-limit retries remain
       bounded and account sends are serialized.
-- [ ] `git status` is checked before and after deployment; pre-existing user
+- [x] `git status` is checked before and after deployment; pre-existing user
       changes are preserved.
+
+## Deployment record
+
+- Plugin commits: `68636c6` (serialization/quiet delivery), `efa55cb`
+  (rate-limit classification); both pushed to `origin/master`.
+- Hermes core commits: SG `89b6ec6f1`, `a64005ee7`; KR `15d041f`, `4b996b5`.
+- Runtime core files were synced into the `/opt/hermes` mount after the source
+  commits and backed up under `backups/weixin-stability-20260823/runtime-core`.
+- SG and KR Gateway services were restarted and reported `weixin_multi
+  connected` and `Gateway running` after the rollout.
+- Effective WeChat display settings on both hosts: `tool_progress=off`,
+  `interim_assistant_messages=false`, `long_running_notifications=false`,
+  `busy_ack_detail=false`, `streaming=false`.
+- Runtime regression smoke confirmed that a `rate_limited` result does not
+  trigger Hermes' plain-text fallback. The full async retry test file was not
+  runnable on the host system because `pytest-asyncio` is absent.
 
 ## Rollback
 
