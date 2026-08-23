@@ -176,6 +176,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    classify_send_error,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -2519,7 +2520,12 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            error = str(exc)
+            return SendResult(
+                success=False,
+                error=error,
+                error_kind=classify_send_error(None, error),
+            )
 
     async def send(
         self,
@@ -2648,7 +2654,12 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            error = str(exc)
+            return SendResult(
+                success=False,
+                error=error,
+                error_kind=classify_send_error(None, error),
+            )
 
     async def _send_video_unlocked(
         self,
@@ -2674,7 +2685,12 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            error = str(exc)
+            return SendResult(
+                success=False,
+                error=error,
+                error_kind=classify_send_error(None, error),
+            )
 
     async def _send_voice_unlocked(
         self,
@@ -2707,7 +2723,12 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            error = str(exc)
+            return SendResult(
+                success=False,
+                error=error,
+                error_kind=classify_send_error(None, error),
+            )
 
     async def send_document(
         self,

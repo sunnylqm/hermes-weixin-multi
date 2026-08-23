@@ -24,9 +24,11 @@ which left a race around context tokens and account routing.
 3. Serialize outbound messages by chat and iLink requests by account. Enforce
    a minimum send interval and use a dedicated exponential backoff budget for
    `ret=-2` rate limits.
-4. Keep retries bounded and observable. Log scheduled inbound events, queueing,
+4. Classify rate-limit failures so Hermes core does not send a second
+   plain-text fallback into the same throttle window.
+5. Keep retries bounded and observable. Log scheduled inbound events, queueing,
    and deduplication reasons without logging message contents or credentials.
-5. Add the same low-noise default to Hermes core for the custom platform key so
+6. Add the same low-noise default to Hermes core for the custom platform key so
    a newly-created profile cannot silently re-enable interim messages.
 
 ## Verification checklist
