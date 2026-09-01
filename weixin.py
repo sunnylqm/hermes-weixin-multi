@@ -1640,36 +1640,63 @@ class WeixinMultiAdapter(BasePlatformAdapter):
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
         pending_file = os.path.join(hermes_home, "weixin", "pending_qr.json")
         session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-        
+        current_base_url = ILINK_BASE_URL
+        last_qrcode = ""
+
         try:
             while True:
                 try:
                     if not os.path.exists(pending_file):
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(3)
                         continue
-                    
+
                     with open(pending_file) as f:
                         pending = json.load(f)
-                    
+
                     qrcode_value = pending.get("qrcode", "")
                     created_at = pending.get("created_at", 0)
-                    
-                    if time.time() - created_at > QR_LOGIN_TTL_SECONDS:
-                        os.remove(pending_file)
+                    started_at = pending.get("started_at", created_at)
+
+                    if not qrcode_value:
+                        await asyncio.sleep(3)
+                        continue
+
+                    if qrcode_value != last_qrcode:
+                        last_qrcode = qrcode_value
+                        current_base_url = pending.get("base_url") or ILINK_BASE_URL
+
+                    if time.time() - started_at > 900:
+                        logger.info("QR login lifetime exceeded, removing pending_qr.json")
+                        try:
+                            os.remove(pending_file)
+                        except OSError:
+                            pass
+                        try:
+                            import auth_manager as am
+                            am.send_telegram_notification(
+                                "⌛ <b>微信扫码登录已超时</b>\n"
+                                "二维码登录流程已超过 15 分钟，请重新发送 /wechat-login。"
+                            )
+                        except Exception:
+                            pass
                         await asyncio.sleep(5)
                         continue
-                    
-                    status_url = f"{ILINK_BASE_URL}/{EP_GET_QR_STATUS}?qrcode={qrcode_value}"
-                    timeout = aiohttp.ClientTimeout(total=QR_TIMEOUT_MS / 1000)
-                    async with session.get(status_url, timeout=timeout) as resp:
-                        status_resp = await resp.json(content_type=None)
-                    
+
+                    status_url = f"{current_base_url.rstrip('/')}/{EP_GET_QR_STATUS}?qrcode={qrcode_value}"
+                    timeout = aiohttp.ClientTimeout(total=35)
+                    try:
+                        async with session.get(status_url, timeout=timeout) as resp:
+                            status_resp = await resp.json(content_type=None)
+                    except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
+                        await asyncio.sleep(1)
+                        continue
+
                     status = str(status_resp.get("status") or "wait")
-                    
+
                     if status == "confirmed":
                         token_new = str(status_resp.get("bot_token") or "")
-                        base_url_new = str(status_resp.get("baseurl") or ILINK_BASE_URL)
-                        
+                        base_url_new = str(status_resp.get("baseurl") or current_base_url)
+
                         if token_new:
                             accounts_dir = os.path.join(hermes_home, "weixin", "accounts")
                             os.makedirs(accounts_dir, exist_ok=True)
@@ -1678,7 +1705,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                             while f"wechat-{n}" in existing:
                                 n += 1
                             acct_id = f"wechat-{n}"
-                            
+
                             # Canonical helper: atomic write + chmod 0600.
                             save_weixin_account(
                                 hermes_home,
@@ -1692,7 +1719,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                                 "base_url": base_url_new,
                                 "cdn_base_url": WEIXIN_CDN_BASE_URL,
                             }
-                            
+
                             no_timeout = aiohttp.ClientTimeout(total=None)
                             poll_session = aiohttp.ClientSession(
                                 trust_env=True, connector=_make_ssl_connector()
@@ -1711,22 +1738,97 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                             self._poll_tasks[acct_id] = task
                             _LIVE_ADAPTERS[token_new] = self
                             accountPolling[acct_id] = {"running": True, "task": task}
-                            
+
                             logger.info("✅ 新账号 %s 登录成功（从 WebUI /wechat-login）！", acct_id)
-                        
-                        os.remove(pending_file)
-                    
-                    elif status in ("wait", "scaned", "scaned_but_redirect"):
-                        await asyncio.sleep(3)
-                    
+                            try:
+                                import auth_manager as am
+                                am.send_telegram_notification(
+                                    f"✅ <b>微信账号 {acct_id} 绑定并登录成功！</b>\n"
+                                    "已自动加入轮询列表并上线运行。"
+                                )
+                            except Exception:
+                                pass
+
+                        try:
+                            os.remove(pending_file)
+                        except OSError:
+                            pass
+
+                    elif status == "scaned":
+                        logger.info("微信二维码已扫码，等待手机端确认登录...")
+                        await asyncio.sleep(2)
+
+                    elif status == "scaned_but_redirect":
+                        redirect_host = str(status_resp.get("redirect_host") or "")
+                        if redirect_host:
+                            current_base_url = f"https://{redirect_host}"
+                            pending["base_url"] = current_base_url
+                            logger.info("微信扫码重定向至: %s", redirect_host)
+                            atomic_json_write(Path(pending_file), pending)
+                        await asyncio.sleep(1)
+
+                    elif status == "wait":
+                        await asyncio.sleep(1)
+
                     elif status == "expired":
-                        logger.info("QR expired, removing pending_qr.json")
-                        os.remove(pending_file)
-                        await asyncio.sleep(5)
-                    
+                        if time.time() - started_at >= 900:
+                            logger.info("QR login lifetime exceeded, removing pending_qr.json")
+                            try:
+                                os.remove(pending_file)
+                            except OSError:
+                                pass
+                            try:
+                                import auth_manager as am
+                                am.send_telegram_notification(
+                                    "⌛ <b>微信扫码登录已超时</b>\n"
+                                    "二维码登录流程已超过 15 分钟，请重新发送 /wechat-login。"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                current_base_url = ILINK_BASE_URL
+                                qr_resp = await _api_get(
+                                    session,
+                                    base_url=ILINK_BASE_URL,
+                                    endpoint=f"{EP_GET_BOT_QR}?bot_type=3",
+                                    timeout_ms=QR_TIMEOUT_MS,
+                                )
+                                qrcode_new = str(qr_resp.get("qrcode") or "")
+                                qr_link_new = str(
+                                    qr_resp.get("qrcode_img_content") or qrcode_new
+                                )
+                                if not qrcode_new:
+                                    raise RuntimeError("QR response missing qrcode")
+                                last_qrcode = qrcode_new
+                                atomic_json_write(
+                                    Path(pending_file),
+                                    {
+                                        "qrcode": qrcode_new,
+                                        "link": qr_link_new,
+                                        "base_url": ILINK_BASE_URL,
+                                        "created_at": time.time(),
+                                        "started_at": started_at,
+                                    },
+                                )
+                                try:
+                                    import auth_manager as am
+                                    import html
+                                    am.send_telegram_notification(
+                                        "🔄 <b>微信扫码二维码已自动刷新</b>\n"
+                                        "━━━━━━━━━━━━━━━━━━\n"
+                                        f"请扫描新二维码：<code>{html.escape(qr_link_new)}</code>\n\n"
+                                        "登录流程仍在 15 分钟有效期内。"
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                logger.warning("Failed to refresh expired QR: %s", e)
+                                await asyncio.sleep(5)
+
                     else:
                         await asyncio.sleep(3)
-                
+
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

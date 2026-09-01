@@ -99,10 +99,10 @@ async def login():
                     session,
                     base_url=current_base_url,
                     endpoint=f"{EP_GET_QR_STATUS}?qrcode={qrcode_value}",
-                    timeout_ms=QR_TIMEOUT_MS,
+                    timeout_ms=35000,
                 )
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
             
             status = str(status_resp.get("status") or "wait")

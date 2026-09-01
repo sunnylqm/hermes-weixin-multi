@@ -105,6 +105,7 @@ CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 EP_GET_BOT_QR = "/ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "/ilink/bot/get_qrcode_status"
 QR_TIMEOUT_MS = 5000
+QR_LIFETIME_SECONDS = 900  # 15 minutes total; refresh server-expired QR codes within this window.
 
 def _make_verified_connector(aio):
     """TCPConnector with certificate verification always on.
@@ -243,15 +244,19 @@ def _pending_qr_file() -> str:
     hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
     return os.path.join(hermes_home, "weixin", "pending_qr.json")
 
-def _save_pending_qr(qrcode_value: str, qr_link: str) -> None:
+def _save_pending_qr(
+    qrcode_value: str, qr_link: str, *, started_at: Optional[float] = None
+) -> None:
     """Save pending QR for gateway to poll."""
     pending_file = _pending_qr_file()
     os.makedirs(os.path.dirname(pending_file), exist_ok=True)
+    now = time.time()
     with open(pending_file, "w") as f:
         json.dump({
             "qrcode": qrcode_value,
             "link": qr_link,
-            "created_at": time.time(),
+            "created_at": now,
+            "started_at": started_at if started_at is not None else now,
         }, f)
 
 def _load_pending_qr() -> Optional[dict]:
@@ -262,8 +267,10 @@ def _load_pending_qr() -> Optional[dict]:
     try:
         with open(pending_file) as f:
             data = json.load(f)
-        # Expire once the scan window has passed
-        if time.time() - data.get("created_at", 0) > PENDING_QR_TTL_SECONDS:
+        # Keep the login flow alive for 15 minutes. The server-side QR may
+        # expire sooner; the background watcher refreshes it and re-notifies
+        # the Telegram admin.
+        if time.time() - data.get("started_at", data.get("created_at", 0)) > QR_LIFETIME_SECONDS:
             os.remove(pending_file)
             return None
         return data
@@ -426,7 +433,7 @@ def register(ctx):
                     f"📱 微信扫码登录\n\n"
                     f"请用微信扫描：\n"
                     f"{qr_link}\n\n"
-                    f"⏳ 二维码5分钟内有效\n\n"
+                    f"⏳ 登录流程最长15分钟，二维码过期会自动刷新\n\n"
                     f"扫码后手机上点「确认」即可完成登录。\n"
                     f"用 /wechat-list 查看账号状态。"
                 )
@@ -435,7 +442,7 @@ def register(ctx):
                     "📱 <b>微信扫码登录</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"请用微信扫描：\n<code>{html.escape(qr_link)}</code>\n\n"
-                    "⏳ 二维码 5 分钟内有效，扫码后在手机上点「确认」即可完成登录。"
+                    "⏳ 登录流程最长 15 分钟，二维码过期会自动刷新；扫码后在手机上点「确认」即可完成登录。"
                 )
                 if verdict == am.ADMIN_OK:
                     return body
@@ -495,6 +502,36 @@ def register(ctx):
         handler=_handle_wechat_list_cmd,
         description="查看所有微信账号状态",
     )
+
+    # ── Telegram Invite Commands ──
+    async def _handle_wechat_invite_cmd(raw_args: str = "", *args, **kwargs) -> str:
+        """Generate a one-time invite code; redemption in WeChat auto-approves."""
+        am, verdict, denial = _guard(raw_args, *args, **kwargs)
+        if denial:
+            return denial
+        parts = (raw_args or "").split()
+        max_uses = 1
+        ttl_hours = 72
+        try:
+            if parts:
+                max_uses = max(1, int(parts[0]))
+            if len(parts) > 1:
+                ttl_hours = max(1, int(parts[1]))
+        except ValueError:
+            return "❌ 格式：/wechat-invite [使用次数] [有效小时]\n例如：/wechat-invite 1 72"
+        creator = "telegram_admin"
+        code, info = am.create_invite(creator=creator, max_uses=max_uses, ttl_hours=ttl_hours)
+        body = (
+            f"🎟️ 微信邀请已创建\n\n"
+            f"邀请码：<code>{html.escape(code)}</code>\n"
+            f"有效期：{ttl_hours} 小时\n"
+            f"可用次数：{max_uses}\n\n"
+            f"请将邀请码转发给微信用户，让对方在微信中直接发送该码；验证后将自动加入，无需审核。"
+        )
+        if verdict != am.ADMIN_OK:
+            am.send_telegram_notification(body)
+            return "✅ 邀请码已生成，详情已发送至 Telegram 管理员会话。"
+        return body
 
     # ── Telegram User Approval Commands ──
     async def _handle_approve_wechat_cmd(raw_args: str = "", *args, **kwargs) -> str:
@@ -626,6 +663,16 @@ def register(ctx):
             am.send_telegram_notification(f"🚫 {html.escape(msg)}")
         return msg
 
+    ctx.register_command(
+        name="wechat-invite",
+        handler=_handle_wechat_invite_cmd,
+        description="生成微信自动入群邀请码 (/wechat-invite [次数] [有效小时])",
+    )
+    ctx.register_command(
+        name="wechat_invite",
+        handler=_handle_wechat_invite_cmd,
+        description="生成微信自动入群邀请码",
+    )
     ctx.register_command(
         name="approve_wechat",
         handler=_handle_approve_wechat_cmd,

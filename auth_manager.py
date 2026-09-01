@@ -19,6 +19,169 @@ AUTH_DIR = os.path.join(HERMES_HOME, "weixin")
 APPROVED_FILE = os.path.join(AUTH_DIR, "approved_users.json")
 PENDING_FILE = os.path.join(AUTH_DIR, "pending_requests.json")
 PROFILE_MAP_FILE = os.path.join(AUTH_DIR, "profile_map.json")
+INVITE_FILE = os.path.join(AUTH_DIR, "invites.json")
+
+# ── Invite code system (TG admin generates, WeChat user redeems to auto-approve) ──
+INVITE_CODE_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+INVITE_TTL_HOURS_DEFAULT = 72
+
+def _load_invites() -> dict:
+    return _load_json(INVITE_FILE, {})
+
+def _save_invites(data: dict) -> None:
+    _save_json(INVITE_FILE, data)
+
+def create_invite(creator: str = "telegram_admin", max_uses: int = 1, ttl_hours: int = INVITE_TTL_HOURS_DEFAULT) -> Tuple[str, dict]:
+    """Create a new invite code. Returns (code, info)."""
+    invites = _load_invites()
+    now = time.time()
+    # cleanup expired
+    for c, info in list(invites.items()):
+        if now > info.get("expires_at", 0):
+            del invites[c]
+    code = secrets.token_hex(4)
+    while code in invites or code in _load_json(PENDING_FILE, {}):
+        code = secrets.token_hex(4)
+    info = {
+        "created_at": now,
+        "created_by": creator,
+        "max_uses": max(1, int(max_uses)),
+        "uses": 0,
+        "expires_at": now + int(ttl_hours) * 3600,
+        "ttl_hours": int(ttl_hours),
+    }
+    invites[code] = info
+    _save_invites(invites)
+    return code, info
+
+def list_invites() -> dict:
+    invites = _load_invites()
+    now = time.time()
+    # purge expired on list
+    changed = False
+    for c, info in list(invites.items()):
+        if now > info.get("expires_at", 0):
+            del invites[c]
+            changed = True
+    if changed:
+        _save_invites(invites)
+    return invites
+
+def _extract_invite_code(text: str) -> Optional[str]:
+    if not text:
+        return None
+    s = text.strip().lower()
+    # direct code
+    if INVITE_CODE_RE.match(s):
+        return s
+    # try to find 8-hex substring inside message (e.g. "邀请码 ab12cd34")
+    import re as _re
+    m = _re.search(r"[0-9a-f]{8}", s)
+    if m:
+        cand = m.group(0)
+        # verify it exists as active invite
+        invites = _load_invites()
+        if cand in invites:
+            return cand
+    return None
+
+def notify_telegram_auto_join(
+    user_id: str,
+    account_id: Optional[str] = None,
+    source: str = "auto_approve",
+) -> bool:
+    """Notify the local Telegram admin after a no-review WeChat join."""
+    source_label = "邀请码自动加入" if source == "invite" else "免审核自动加入"
+    return send_telegram_notification(
+        "🔔 <b>微信新用户已自动加入</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>用户 ID:</b> <code>{html.escape(user_id)}</code>\n"
+        f"🤖 <b>接收账号:</b> <code>{html.escape(account_id or '默认')}</code>\n"
+        f"📥 <b>加入方式:</b> {source_label}\n"
+        f"⏰ <b>加入时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "✅ 已自动放行，无需管理员操作。"
+    )
+
+def try_redeem_invite(text: str, user_id: str, account_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Try to redeem an invite code contained in *text* for *user_id*.
+    Returns (redeemed, message). If redeemed, user is auto-approved.
+    """
+    code = _extract_invite_code(text)
+    if not code:
+        return False, ""
+    invites = _load_invites()
+    info = invites.get(code)
+    if not info:
+        return False, ""
+    now = time.time()
+    if now > info.get("expires_at", 0):
+        del invites[code]
+        _save_invites(invites)
+        return False, "邀请码已过期"
+    if info.get("uses", 0) >= info.get("max_uses", 1):
+        return False, "邀请码已达使用上限"
+    # already approved? then just consume invite and report success
+    if is_user_approved(user_id):
+        return False, ""
+    # approve user directly (bypass pending)
+    approved_data = _load_json(APPROVED_FILE, {"approved": {}})
+    if "approved" not in approved_data:
+        approved_data["approved"] = {}
+    approved_data["approved"][user_id] = {
+        "approved_at": datetime.now().isoformat(),
+        "approved_by": f"invite:{code} ({info.get('created_by','')})",
+        "account_id": account_id or "",
+        "invite_code": code,
+    }
+    _save_json(APPROVED_FILE, approved_data)
+    # consume invite
+    info["uses"] = info.get("uses", 0) + 1
+    if info["uses"] >= info.get("max_uses", 1):
+        del invites[code]
+    else:
+        invites[code] = info
+    _save_invites(invites)
+    # ensure profile
+    try:
+        ensure_user_profile(user_id)
+    except Exception as e:
+        logger.error("[Weixin Auth] invite redeem profile creation failed for %s: %s", user_id, e)
+    if not notify_telegram_auto_join(user_id, account_id=account_id, source="invite"):
+        logger.warning("[Weixin Auth] Telegram auto-join notification failed for invite user=%s", user_id)
+    # notify wechat user
+    try:
+        send_wechat_message(user_id, account_id=account_id, text=APPROVED_COMMANDS_TEXT)
+    except Exception:
+        pass
+    logger.info("[Weixin Auth] Invite code=%s redeemed by user=%s -> auto-approved", code, user_id)
+    return True, f"✅ 邀请码验证成功，已自动批准接入！"
+
+def auto_approve_user(user_id: str, account_id: Optional[str] = None, approved_by: str = "auto_approve") -> bool:
+    """Auto-approve a WeChat user without manual review (invite-free mode)."""
+    if is_user_approved(user_id):
+        return True
+    approved_data = _load_json(APPROVED_FILE, {"approved": {}})
+    if "approved" not in approved_data:
+        approved_data["approved"] = {}
+    approved_data["approved"][user_id] = {
+        "approved_at": datetime.now().isoformat(),
+        "approved_by": approved_by,
+        "account_id": account_id or "",
+    }
+    _save_json(APPROVED_FILE, approved_data)
+    try:
+        ensure_user_profile(user_id)
+    except Exception as e:
+        logger.error("[Weixin Auth] auto-approve profile creation failed for %s: %s", user_id, e)
+    if not notify_telegram_auto_join(user_id, account_id=account_id):
+        logger.warning("[Weixin Auth] Telegram auto-join notification failed for user=%s", user_id)
+    # Push the no-review welcome greeting; failure is non-fatal.
+    try:
+        send_wechat_message(user_id, account_id=account_id, text=WELCOME_ON_SCAN_TEXT)
+    except Exception:
+        pass
+    logger.info("[Weixin Auth] Auto-approved user=%s (by %s)", user_id, approved_by)
+    return True
 
 # In-memory store for pending two-step unregister confirmations (user_id -> timestamp)
 UNREGISTER_PENDING: Dict[str, float] = {}
@@ -30,8 +193,7 @@ WELCOME_ON_SCAN_TEXT = """👋 您好！很高兴与您相遇。我是您的专�
 
 💡 隐私与数据说明：
 系统将为您提供专属独立 Profile 与物理记忆隔离。如需注销账号并彻底清空所有个人画像、记忆与对话数据，您可以随时发送【注销】或【/unregister】。
-
-⏳ 系统正在为您接入中，请稍候..."""
+"""
 
 APPROVED_COMMANDS_TEXT = """🎉 您的接入申请已获批准，专属独立空间已就绪！
 
@@ -355,18 +517,19 @@ def forget_profile_mapping(user_id: str) -> None:
 
 
 # A profile cloned from "default" inherits its .env verbatim, including the
-# shared platform credentials. That makes every per-user profile try to start
+# shared platform settings. That makes every per-user profile try to start
 # its own Telegram/Discord/WeChat adapters (the gateway then refuses them as
 # duplicate-credential) and leaves a copy of the master bot tokens in each
-# user's directory. Strip platform credentials — but never the model API keys,
+# user's directory. Strip platform settings — but never the model API keys,
 # which the per-user agent needs to run.
 _PLATFORM_CREDENTIAL_RE = re.compile(
     r"^(TELEGRAM|DISCORD|SLACK|WHATSAPP|SIGNAL|MATRIX|LINE|VIBER|TWILIO|WEIXIN"
-    r"|WECHAT|MESSENGER|INSTAGRAM|IMESSAGE|RELAY)_[A-Z0-9_]*"
-    r"(TOKEN|SECRET|PASSWORD|CREDENTIAL)$"
+    r"|WECHAT|MESSENGER|INSTAGRAM|IMESSAGE|RELAY)_[A-Z0-9_]+$"
 )
 _EXTRA_SCRUBBED_ENV_KEYS = frozenset({
     "HERMES_GATEWAY_TOKEN",
+    "GATEWAY_ALLOW_ALL_USERS",
+    "API_SERVER_KEY",
     # Not a credential, but an *enablement* key: the host enables the built-in
     # weixin platform when either WEIXIN_TOKEN or WEIXIN_ACCOUNT_ID is set
     # (gateway/config.py: `if weixin_token or weixin_account_id`). Leaving it
@@ -485,8 +648,9 @@ def ensure_user_profile(user_id: str) -> str:
 
     profile_name = profile_name_for(user_id)
     if profile_exists(profile_name):
-        # Existing is not the same as isolated — the host may have created it.
+        # Existing is not the same as isolated — the host may have cloned it.
         purge_inherited_memories(profile_name)
+        scrub_platform_credentials(os.path.join(_profiles_dir(), profile_name, ".env"))
         return profile_name
 
     logger.info("[Weixin Auth] Creating isolated profile for user=%s -> %s", user_id, profile_name)
