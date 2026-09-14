@@ -714,22 +714,40 @@ async def _get_upload_url(
     )
 
 
+def _get_cdn_proxy() -> Optional[str]:
+    proxy = (
+        os.getenv("WEIXIN_CDN_PROXY")
+        or os.getenv("WEIXIN_PROXY")
+        or ""
+    ).strip()
+    return proxy if proxy else None
+
+
 async def _upload_ciphertext(
     session: "aiohttp.ClientSession",
     *,
     ciphertext: bytes,
     upload_url: str,
+    proxy: Optional[str] = None,
 ) -> str:
     """Upload encrypted media to the CDN.
 
     Accepts either a constructed CDN URL (from upload_param) or a direct
     upload_full_url — both use POST with the raw ciphertext as the body.
     """
+    effective_proxy = proxy or _get_cdn_proxy()
+    if effective_proxy:
+        logger.debug("[Weixin] Uploading to CDN via proxy: %s", effective_proxy)
     # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
     # "Timeout context manager should be used inside a task" errors when
     # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
     async def _do_upload() -> str:
-        async with session.post(upload_url, data=ciphertext, headers={"Content-Type": "application/octet-stream"}) as response:
+        async with session.post(
+            upload_url,
+            data=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            proxy=effective_proxy,
+        ) as response:
             if response.status == 200:
                 encrypted_param = response.headers.get("x-encrypted-param")
                 if encrypted_param:
@@ -747,11 +765,15 @@ async def _download_bytes(
     *,
     url: str,
     timeout_seconds: float = 60.0,
+    proxy: Optional[str] = None,
 ) -> bytes:
+    effective_proxy = proxy or _get_cdn_proxy()
+    if effective_proxy:
+        logger.debug("[Weixin] Downloading from CDN via proxy: %s", effective_proxy)
     # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
     # "Timeout context manager should be used inside a task" errors.
     async def _do_download() -> bytes:
-        async with session.get(url) as response:
+        async with session.get(url, proxy=effective_proxy) as response:
             response.raise_for_status()
             return await response.read()
     return await asyncio.wait_for(_do_download(), timeout=timeout_seconds)
@@ -802,16 +824,18 @@ async def _download_and_decrypt_media(
     aes_key_b64: Optional[str],
     full_url: Optional[str],
     timeout_seconds: float,
+    proxy: Optional[str] = None,
 ) -> bytes:
     if encrypted_query_param:
         raw = await _download_bytes(
             session,
             url=_cdn_download_url(cdn_base_url, encrypted_query_param),
             timeout_seconds=timeout_seconds,
+            proxy=proxy,
         )
     elif full_url:
         _assert_weixin_cdn_url(full_url)
-        raw = await _download_bytes(session, url=full_url, timeout_seconds=timeout_seconds)
+        raw = await _download_bytes(session, url=full_url, timeout_seconds=timeout_seconds, proxy=proxy)
     else:
         raise RuntimeError("media item had neither encrypt_query_param nor full_url")
     if aes_key_b64:
@@ -1441,6 +1465,13 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
+        self._cdn_proxy = str(
+            extra.get("cdn_proxy")
+            or extra.get("proxy_url")
+            or os.getenv("WEIXIN_CDN_PROXY")
+            or os.getenv("WEIXIN_PROXY")
+            or ""
+        ).strip() or None
 
         # ---------- Multi-account support ----------
         # Per-account state: {account_id: {token, base_url, cdn_base_url, poll_session, send_session, poll_task, sync_buf}}
@@ -2336,6 +2367,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                 or media.get("aes_key"),
                 full_url=media.get("full_url"),
                 timeout_seconds=30.0,
+                proxy=self._cdn_proxy,
             )
             return cache_image_from_bytes(data, ".jpg")
         except Exception as exc:
@@ -2357,6 +2389,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
                 timeout_seconds=120.0,
+                proxy=self._cdn_proxy,
             )
             return cache_document_from_bytes(data, "video.mp4")
         except Exception as exc:
@@ -2381,6 +2414,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
+                proxy=self._cdn_proxy,
             )
             return cache_document_from_bytes(data, filename), mime
         except Exception as exc:
@@ -2405,6 +2439,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
+                proxy=self._cdn_proxy,
             )
             return cache_audio_from_bytes(data, ".silk")
         except Exception as exc:
@@ -2899,8 +2934,9 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             raise RuntimeError("No send session available")
         # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
         # "Timeout context manager should be used inside a task" errors.
+        effective_proxy = self._cdn_proxy or _get_cdn_proxy()
         async def _do_fetch():
-            async with send_session.get(url) as response:
+            async with send_session.get(url, proxy=effective_proxy) as response:
                 response.raise_for_status()
                 return await response.read()
         data = await asyncio.wait_for(_do_fetch(), timeout=30)
@@ -2959,6 +2995,7 @@ class WeixinMultiAdapter(BasePlatformAdapter):
             send_session,
             ciphertext=ciphertext,
             upload_url=upload_url,
+            proxy=self._cdn_proxy,
         )
         context_token = self._token_store.get(acc_id, chat_id)
         # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).

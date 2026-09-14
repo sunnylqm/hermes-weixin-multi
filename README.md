@@ -139,6 +139,7 @@ variables:
 | `send_rate_limit_retries` | `2` | `ret=-2` 限流错误的专用重试次数 |
 | `send_chunk_retries` | `4` | 非限流发送错误的重试次数 |
 | `send_chunk_retry_delay_seconds` | `1.0` | 普通错误的基础退避秒数 |
+| `cdn_proxy` | 无 | 微信 CDN 专用代理（多媒体上传与下载；如海外主机访问 `novac2c.cdn.weixin.qq.com` 丢包超时，可配置 `socks5://127.0.0.1:40000` 或 HTTP 代理；环境变量 `WEIXIN_CDN_PROXY` / `WEIXIN_PROXY`） |
 
 出现限流时，插件会对 `ret=-2` 使用指数退避并加少量抖动；同一会话的
 旧消息不会越过正在发送的新消息。调整前应先观察 Gateway 日志中的
